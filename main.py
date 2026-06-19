@@ -10,7 +10,8 @@ from queue import Queue
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QListView, QLabel, QScrollArea, QFileDialog,
-    QPushButton, QFrame, QGraphicsDropShadowEffect, QProgressDialog, QGridLayout
+    QPushButton, QFrame, QGraphicsDropShadowEffect, QProgressDialog, QGridLayout,
+    QTabWidget, QStackedWidget
 )
 from PyQt5.QtCore import Qt, QRect, QSize, QPoint, pyqtSignal, QThread, QTimer, QByteArray, QBuffer
 from PyQt5.QtGui import QPixmap, QImage, QColor, QPalette, QBrush, QIcon, QPainter
@@ -25,10 +26,13 @@ def path_hash(path):
 # 缓存管理器 - 管理 JSON 记录和缩略图文件
 class CacheManager:
     """基于 JSON 的缓存管理器"""
-    def __init__(self, cache_dir):
+    def __init__(self, cache_dir, root_folder):
         self.cache_dir = cache_dir
+        self.root_folder = root_folder.replace('\\', '/')
         self.manifest_path = os.path.join(cache_dir, 'cache_manifest.json')
+        self.favorites_path = os.path.join(cache_dir, 'favorites.json')
         self.manifest = self._load_manifest()
+        self.favorites = self._load_favorites()
 
     def _load_manifest(self):
         """加载缓存清单"""
@@ -36,7 +40,6 @@ class CacheManager:
             try:
                 with open(self.manifest_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    print(f"[CacheManager] 加载缓存清单: {len(data)} 条记录")
                     return data
             except Exception as e:
                 print(f"[CacheManager] 加载缓存清单失败: {e}")
@@ -49,11 +52,36 @@ class CacheManager:
             with open(self.manifest_path, 'w', encoding='utf-8') as f:
                 json.dump(self.manifest, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"保存缓存清单失败: {e}")
+            print(f"[CacheManager] 保存缓存清单失败: {e}")
+
+    def _load_favorites(self):
+        """加载收藏列表"""
+        if os.path.exists(self.favorites_path):
+            try:
+                with open(self.favorites_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    # 数据结构: {"collections": {"默认收藏夹": ["rel_path1", "rel_path2"]}}
+                    collections = data.get('collections', {})
+                    if '默认收藏夹' not in collections:
+                        collections['默认收藏夹'] = []
+                    data['collections'] = collections
+                    print(f"[CacheManager] 加载收藏列表: {len(collections.get('默认收藏夹', []))} 个视频")
+                    return data
+            except Exception as e:
+                print(f"[CacheManager] 加载收藏列表失败: {e}")
+        return {'collections': {'默认收藏夹': []}}
+
+    def save_favorites(self):
+        """保存收藏列表"""
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            with open(self.favorites_path, 'w', encoding='utf-8') as f:
+                json.dump(self.favorites, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[CacheManager] 保存收藏列表失败: {e}")
 
     def get_cache_path(self, video_relative_path):
         """根据视频相对路径获取缓存文件路径"""
-        # 用相对路径的哈希作为缓存文件名，统一使用正斜杠
         normalized = video_relative_path.replace('\\', '/')
         cache_key = path_hash(normalized)
         return os.path.join(self.cache_dir, f"{cache_key}.jpg")
@@ -61,30 +89,48 @@ class CacheManager:
     def cache_exists(self, video_relative_path):
         """检查缓存是否存在"""
         cache_path = self.get_cache_path(video_relative_path)
-        exists = os.path.exists(cache_path)
-        print(f"[CacheManager] cache_exists: rel_path={video_relative_path}, cache={cache_path}, exists={exists}")
-        return exists, cache_path
+        return os.path.exists(cache_path), cache_path
 
     def add_cache(self, video_relative_path, cache_path):
         """添加缓存记录"""
         cache_key = path_hash(video_relative_path)
         self.manifest[video_relative_path] = cache_key
-        print(f"[CacheManager] add_cache: rel_path={video_relative_path}, key={cache_key}")
         self._save_manifest()
 
-    def get_all_cached_videos(self):
-        """获取所有已缓存的视频相对路径"""
-        cached = []
-        for rel_path, cache_key in list(self.manifest.items()):
-            cache_path = os.path.join(self.cache_dir, f"{cache_key}.jpg")
-            if os.path.exists(cache_path):
-                cached.append(rel_path)
-            else:
-                # 缓存文件已删除，清理记录
-                del self.manifest[rel_path]
-        if self.manifest:
-            self._save_manifest()
-        return cached
+    def is_favorite(self, video_relative_path):
+        """检查视频是否在默认收藏夹中"""
+        normalized = video_relative_path.replace('\\', '/')
+        fav_list = self.favorites.get('collections', {}).get('默认收藏夹', [])
+        return normalized in fav_list
+
+    def toggle_favorite(self, video_relative_path):
+        """切换收藏状态，返回新状态 (True=已收藏)"""
+        normalized = video_relative_path.replace('\\', '/')
+        fav_list = self.favorites.get('collections', {}).setdefault('默认收藏夹', [])
+        if normalized in fav_list:
+            fav_list.remove(normalized)
+            self.save_favorites()
+            return False
+        else:
+            fav_list.append(normalized)
+            self.save_favorites()
+            return True
+
+    def get_favorite_videos(self):
+        """获取默认收藏夹中所有视频的绝对路径列表"""
+        fav_list = self.favorites.get('collections', {}).get('默认收藏夹', [])
+        result = []
+        for rel_path in fav_list:
+            abs_path = os.path.join(self.root_folder, rel_path)
+            if os.path.exists(abs_path):
+                result.append(abs_path)
+        return result
+
+    def get_favorite_count(self):
+        """获取默认收藏夹视频数量"""
+        fav_list = self.favorites.get('collections', {}).get('默认收藏夹', [])
+        # 只统计实际存在的视频
+        return len([f for f in fav_list if os.path.exists(os.path.join(self.root_folder, f))])
 
 
 class ThumbnailManager(QThread):
@@ -458,13 +504,14 @@ class CollectionItem(QWidget):
 
 
 class VideoItem(QWidget):
-    """视频项组件 - 异步加载缩略图"""
-    def __init__(self, video_path, video_relative_path, cache_manager, parent=None, on_thumbnail_ready=None):
+    """视频项组件 - 异步加载缩略图 + 收藏按钮"""
+    def __init__(self, video_path, video_relative_path, cache_manager, parent=None, on_thumbnail_ready=None, on_favorite_changed=None):
         super().__init__(parent)
         self.video_path = video_path
-        self.video_relative_path = video_relative_path
+        self.video_relative_path = video_relative_path.replace('\\', '/')
         self.cache_manager = cache_manager
         self.on_thumbnail_ready = on_thumbnail_ready
+        self.on_favorite_changed = on_favorite_changed
 
         self.thumbnail_width = THUMBNAIL_SIZE_VIDEO[0]
         self.thumbnail_height = THUMBNAIL_SIZE_VIDEO[1]
@@ -477,7 +524,13 @@ class VideoItem(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
 
-        self.thumbnail_label = QLabel()
+        # 缩略图容器（用于放置红心按钮）
+        thumb_container = QWidget()
+        thumb_container.setFixedSize(self.thumbnail_width, self.thumbnail_height)
+        thumb_layout = QVBoxLayout(thumb_container)
+        thumb_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.thumbnail_label = QLabel(thumb_container)
         self.thumbnail_label.setFixedSize(self.thumbnail_width, self.thumbnail_height)
         self.thumbnail_label.setStyleSheet("""
             QLabel {
@@ -491,6 +544,16 @@ class VideoItem(QWidget):
         self.thumbnail_label.setAlignment(Qt.AlignCenter)
         self.thumbnail_label.setText("🎬")
 
+        # 收藏按钮（右上角）
+        self.fav_btn = QPushButton(thumb_container)
+        self.fav_btn.setFixedSize(52, 52)
+        self.fav_btn.move(self.thumbnail_width - 58, 6)
+        self.fav_btn.setCursor(Qt.PointingHandCursor)
+        self.fav_btn.setFlat(True)
+        self.fav_btn.clicked.connect(self._on_fav_clicked)
+        self._update_fav_button_style()
+
+        # 名称标签
         self.name_label = QLabel(os.path.splitext(os.path.basename(self.video_path))[0])
         self.name_label.setStyleSheet("""
             QLabel {
@@ -502,10 +565,64 @@ class VideoItem(QWidget):
         self.name_label.setFixedHeight(28)
         self.name_label.setWordWrap(True)
 
-        layout.addWidget(self.thumbnail_label)
+        layout.addWidget(thumb_container)
         layout.addWidget(self.name_label)
 
         self.setFixedWidth(THUMBNAIL_SIZE_VIDEO[0] + 20)
+
+    def _update_fav_button_style(self):
+        """更新收藏按钮样式"""
+        is_fav = False
+        if self.cache_manager:
+            is_fav = self.cache_manager.is_favorite(self.video_relative_path)
+
+        if is_fav:
+            self.fav_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: rgba(230, 50, 50, 0.92);
+                    border: 2px solid rgba(255, 80, 80, 0.9);
+                    border-radius: 26px;
+                    color: white;
+                    font-size: 28px;
+                }
+                QPushButton:hover {
+                    background-color: rgba(255, 70, 70, 0.95);
+                }
+                QPushButton:pressed {
+                    background-color: rgba(200, 40, 40, 0.95);
+                }
+            """)
+            self.fav_btn.setText("♥")
+        else:
+            self.fav_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: rgba(40, 40, 60, 0.7);
+                    border: 2px solid rgba(100, 100, 120, 0.6);
+                    border-radius: 26px;
+                    color: rgba(180, 180, 200, 0.6);
+                    font-size: 28px;
+                }
+                QPushButton:hover {
+                    background-color: rgba(60, 60, 80, 0.8);
+                    border: 2px solid rgba(150, 150, 170, 0.8);
+                    color: rgba(220, 220, 240, 0.9);
+                }
+                QPushButton:pressed {
+                    background-color: rgba(230, 50, 50, 0.92);
+                    border: 2px solid rgba(255, 80, 80, 0.9);
+                    color: white;
+                }
+            """)
+            self.fav_btn.setText("♥")
+
+    def _on_fav_clicked(self):
+        """点击收藏按钮"""
+        if not self.cache_manager:
+            return
+        new_state = self.cache_manager.toggle_favorite(self.video_relative_path)
+        self._update_fav_button_style()
+        if self.on_favorite_changed:
+            self.on_favorite_changed(self.video_relative_path, new_state)
 
     def sizeHint(self):
         return QSize(THUMBNAIL_SIZE_VIDEO[0] + 20, self.thumbnail_height + 50)
@@ -580,7 +697,12 @@ class VideoGridWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.video_items = {}
+        self.on_favorite_changed_callback = None
         self.setup_ui()
+
+    def set_on_favorite_changed(self, callback):
+        """设置收藏状态变更回调"""
+        self.on_favorite_changed_callback = callback
 
     def setup_ui(self):
         self.main_layout = QVBoxLayout(self)
@@ -662,7 +784,11 @@ class VideoGridWidget(QWidget):
 
     def add_video(self, video_path, video_relative_path, cache_manager):
         """添加视频项"""
-        video_item = VideoItem(video_path, video_relative_path, cache_manager, on_thumbnail_ready=self.on_thumbnail_requested)
+        video_item = VideoItem(
+            video_path, video_relative_path, cache_manager,
+            on_thumbnail_ready=self.on_thumbnail_requested,
+            on_favorite_changed=self.on_favorite_changed_callback
+        )
         self.video_items[video_relative_path] = video_item
         self.flow_layout.addWidget(video_item)
 
@@ -672,9 +798,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.root_folder = None
-        self.collections = []  # 收藏夹列表
+        self.collections = []  # 根目录子文件夹收藏夹列表
         self.thumbnail_manager = None
         self.cache_manager = None
+        self.current_tab = 0  # 0 = 根目录, 1 = 收藏夹
 
         self.setup_ui()
         self.apply_styles()
@@ -683,29 +810,26 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("视频收藏集管理器")
         self.setMinimumSize(1400, 900)
 
-        # 设置全局字体
         font = QApplication.font()
-        font.setPointSize(18)  # 增大字体
+        font.setPointSize(18)
         QApplication.setFont(font)
         self.setFont(font)
 
-        # 中央部件
         central_widget = QWidget()
         central_widget.setFont(font)
         self.setCentralWidget(central_widget)
 
-        # 主布局
         main_layout = QHBoxLayout(central_widget)
         main_layout.setSpacing(0)
         main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # 左侧面板 - 收藏夹列表
+        # 左侧面板 - 标签页
         self.left_panel = QFrame()
         self.left_panel.setFixedWidth(320)
         self.left_panel.setFont(font)
-        self.left_panel_layout = QVBoxLayout(self.left_panel)
-        self.left_panel_layout.setContentsMargins(10, 10, 10, 10)
-        self.left_panel_layout.setSpacing(10)
+        left_layout = QVBoxLayout(self.left_panel)
+        left_layout.setContentsMargins(10, 10, 10, 10)
+        left_layout.setSpacing(10)
 
         # 顶部按钮
         self.open_btn = QPushButton("📂 打开文件夹")
@@ -713,17 +837,52 @@ class MainWindow(QMainWindow):
         self.open_btn.setFont(font)
         self.open_btn.clicked.connect(self.open_folder)
 
-        # 收藏夹列表
+        # 两个并排切换按钮：根目录 / 最爱
+        switch_row = QHBoxLayout()
+        switch_row.setSpacing(8)
+
+        self.btn_root = QPushButton("📁 根目录")
+        self.btn_root.setFixedHeight(44)
+        self.btn_root.setFont(font)
+        self.btn_root.setCheckable(True)
+        self.btn_root.clicked.connect(lambda: self.switch_list_mode(0))
+
+        self.btn_fav = QPushButton("⭐ 最爱")
+        self.btn_fav.setFixedHeight(44)
+        self.btn_fav.setFont(font)
+        self.btn_fav.setCheckable(True)
+        self.btn_fav.clicked.connect(lambda: self.switch_list_mode(1))
+
+        switch_row.addWidget(self.btn_root)
+        switch_row.addWidget(self.btn_fav)
+
+        # 初始选中根目录
+        self._update_switch_buttons(0)
+
+        # 列表切换容器
+        self.list_stack = QStackedWidget()
+        self.list_stack.setFont(font)
+        self.list_stack.setStyleSheet("background-color: transparent;")
+
+        # 根目录列表
         self.collection_list = CollectionListWidget()
         self.collection_list.itemClicked.connect(self.on_collection_clicked)
-        self.collection_list.setFont(font)
 
-        self.left_panel_layout.addWidget(self.open_btn)
-        self.left_panel_layout.addWidget(self.collection_list)
+        # 最爱列表 - 虚拟收藏夹
+        self.fav_collection_list = CollectionListWidget()
+        self.fav_collection_list.itemClicked.connect(self.on_fav_collection_clicked)
 
-        # 右侧面板 - 视频预览（传递 self 作为 parent）
+        self.list_stack.addWidget(self.collection_list)
+        self.list_stack.addWidget(self.fav_collection_list)
+
+        left_layout.addWidget(self.open_btn)
+        left_layout.addLayout(switch_row)
+        left_layout.addWidget(self.list_stack)
+
+        # 右侧面板 - 视频预览
         self.right_panel = VideoGridWidget(self)
         self.right_panel.setFont(font)
+        self.right_panel.set_on_favorite_changed(self.on_favorite_changed)
 
         main_layout.addWidget(self.left_panel)
         main_layout.addWidget(self.right_panel)
@@ -764,11 +923,9 @@ class MainWindow(QMainWindow):
             self.thumbnail_manager.stop()
             self.thumbnail_manager.wait()
 
-        # 创建缓存目录和缓存管理器
         cache_dir = os.path.join(self.root_folder, '.videoview', 'cache')
-        self.cache_manager = CacheManager(cache_dir)
+        self.cache_manager = CacheManager(cache_dir, self.root_folder)
 
-        # 创建线程池管理器
         self.thumbnail_manager = ThumbnailManager(self.cache_manager, max_workers=2)
         self.thumbnail_manager.finished.connect(self.on_thumbnail_ready)
         self.thumbnail_manager.start()
@@ -776,6 +933,16 @@ class MainWindow(QMainWindow):
     def on_thumbnail_ready(self, video_relative_path):
         """缩略图生成完成 - 通知右侧面板加载"""
         self.right_panel.on_thumbnail_generated(video_relative_path)
+
+    def on_favorite_changed(self, video_relative_path, new_state):
+        """收藏状态变更 - 更新左侧收藏夹列表显示"""
+        # 刷新左侧虚拟收藏夹列表的显示数量
+        if self.cache_manager:
+            self.refresh_fav_collection_list()
+        # 如果当前在收藏夹标签页且显示的是默认收藏夹，刷新右侧显示
+        if self.current_tab == 1:
+            # 重新显示默认收藏夹内容
+            self.show_default_favorites()
 
     def open_folder(self):
         """打开文件夹对话框"""
@@ -787,7 +954,7 @@ class MainWindow(QMainWindow):
         )
 
         if folder:
-            self.root_folder = folder
+            self.root_folder = folder.replace('\\', '/')
             self.init_thumbnail_manager()
             self.scan_collections(folder)
 
@@ -796,10 +963,9 @@ class MainWindow(QMainWindow):
         self.collections.clear()
         self.collection_list.clear()
 
-        # 扫描子文件夹
         try:
-            subfolders = [d for d in os.listdir(folder_path)
-                         if os.path.isdir(os.path.join(folder_path, d))]
+            subfolders = sorted([d for d in os.listdir(folder_path)
+                                if os.path.isdir(os.path.join(folder_path, d))])
         except Exception as e:
             print(f"扫描文件夹失败: {e}")
             return
@@ -811,7 +977,7 @@ class MainWindow(QMainWindow):
         progress.setMinimumDuration(0)
         progress.setValue(0)
 
-        for i, subfolder in enumerate(sorted(subfolders)):
+        for i, subfolder in enumerate(subfolders):
             if progress.wasCanceled():
                 break
 
@@ -830,8 +996,11 @@ class MainWindow(QMainWindow):
 
         progress.close()
 
-        # 填充列表
+        # 填充根目录标签列表
         self.populate_collection_list()
+
+        # 填充收藏夹标签列表
+        self.populate_fav_collection_list()
 
         # 默认选中第一个
         if self.collections:
@@ -839,7 +1008,7 @@ class MainWindow(QMainWindow):
             self.on_collection_clicked(self.collection_list.item(0))
 
     def populate_collection_list(self):
-        """填充收藏夹列表"""
+        """填充根目录收藏夹列表"""
         self.collection_list.clear()
 
         for collection in self.collections:
@@ -847,14 +1016,12 @@ class MainWindow(QMainWindow):
             if collection['videos'] and self.cache_manager:
                 try:
                     video_path = collection['videos'][0]
-                    # 使用正斜杠确保路径一致
                     video_rel_path = os.path.relpath(video_path, self.root_folder).replace('\\', '/')
-                    print(f"[MainWindow] populate_collection_list: video_path={video_path}, root={self.root_folder}, rel_path={video_rel_path}")
                     exists, cache_path = self.cache_manager.cache_exists(video_rel_path)
                     if exists:
                         thumbnail = cache_path
-                except Exception as e:
-                    print(f"[MainWindow] populate_collection_list error: {e}")
+                except:
+                    pass
 
             item = QListWidgetItem(self.collection_list)
             item.setSizeHint(QSize(280, 420))
@@ -867,25 +1034,144 @@ class MainWindow(QMainWindow):
 
             self.collection_list.setItemWidget(item, widget)
 
+    def refresh_fav_collection_list(self):
+        """刷新收藏夹标签列表（保持当前选择）"""
+        current_row = self.fav_collection_list.currentRow()
+        self.populate_fav_collection_list()
+        if self.fav_collection_list.count() > current_row >= 0:
+            self.fav_collection_list.setCurrentRow(current_row)
+
+    def populate_fav_collection_list(self):
+        """填充虚拟收藏夹列表 - 默认收藏夹"""
+        self.fav_collection_list.clear()
+
+        if not self.cache_manager:
+            return
+
+        # 默认收藏夹 - 使用收藏的第一个视频作为缩略图
+        fav_videos = self.cache_manager.get_favorite_videos()
+        thumbnail = None
+        if fav_videos:
+            try:
+                first_video = fav_videos[0]
+                rel_path = os.path.relpath(first_video, self.root_folder).replace('\\', '/')
+                exists, cache_path = self.cache_manager.cache_exists(rel_path)
+                if exists:
+                    thumbnail = cache_path
+            except:
+                pass
+
+        item = QListWidgetItem(self.fav_collection_list)
+        item.setSizeHint(QSize(280, 420))
+
+        widget = CollectionItem(
+            "默认收藏夹",
+            thumbnail,
+            self.cache_manager.get_favorite_count()
+        )
+
+        self.fav_collection_list.setItemWidget(item, widget)
+
+    def _update_switch_buttons(self, mode):
+        """更新两个切换按钮的样式
+        mode: 0 = 根目录, 1 = 最爱
+        """
+        active_style = """
+            QPushButton {
+                background-color: #3a3a5a;
+                color: #fff;
+                border: 2px solid #5a5a7a;
+                border-radius: 8px;
+                font-size: 18px;
+                font-weight: bold;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #4a4a6a;
+            }
+        """
+        inactive_style = """
+            QPushButton {
+                background-color: #252540;
+                color: #aaa;
+                border: 2px solid #2d2d44;
+                border-radius: 8px;
+                font-size: 18px;
+                font-weight: bold;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #2d2d44;
+                color: #ccc;
+            }
+        """
+        if mode == 0:
+            self.btn_root.setStyleSheet(active_style)
+            self.btn_fav.setStyleSheet(inactive_style)
+            self.btn_root.setChecked(True)
+            self.btn_fav.setChecked(False)
+        else:
+            self.btn_root.setStyleSheet(inactive_style)
+            self.btn_fav.setStyleSheet(active_style)
+            self.btn_root.setChecked(False)
+            self.btn_fav.setChecked(True)
+
+    def switch_list_mode(self, mode):
+        """切换列表模式：0=根目录，1=最爱"""
+        self.current_tab = mode
+        self._update_switch_buttons(mode)
+        self.list_stack.setCurrentIndex(mode)
+
+        # 切换时自动选中第一个项并显示
+        if mode == 0 and self.collections:
+            if self.collection_list.count() > 0:
+                self.collection_list.setCurrentRow(0)
+                self.on_collection_clicked(self.collection_list.item(0))
+        elif mode == 1:
+            if self.fav_collection_list.count() > 0:
+                self.fav_collection_list.setCurrentRow(0)
+                self.on_fav_collection_clicked(self.fav_collection_list.item(0))
+
     def on_collection_clicked(self, item):
-        """收藏夹点击事件"""
+        """根目录收藏夹点击事件"""
+        self.current_tab = 0
         index = self.collection_list.row(item)
         if 0 <= index < len(self.collections):
             collection = self.collections[index]
             self.show_videos(collection)
 
+    def on_fav_collection_clicked(self, item):
+        """收藏夹标签点击事件"""
+        self.current_tab = 1
+        index = self.fav_collection_list.row(item)
+        if index == 0:
+            # 默认收藏夹
+            self.show_default_favorites()
+
     def show_videos(self, collection):
-        """显示视频列表"""
+        """显示普通收藏夹的视频列表"""
+        self.current_tab = 0
         self.right_panel.clear_videos()
         self.right_panel.set_title(f"📁 {collection['name']} ({len(collection['videos'])} 个视频)")
 
         for video_path in collection['videos']:
-            # 计算相对于根目录的路径，使用正斜杠确保一致
             video_relative_path = os.path.relpath(video_path, self.root_folder).replace('\\', '/')
-            print(f"[MainWindow] show_videos: video_path={video_path}, rel_path={video_relative_path}")
-            if self.cache_manager:
-                exists, cache_path = self.cache_manager.cache_exists(video_relative_path)
-                print(f"[MainWindow]   cache_exists={exists}, cache_path={cache_path}")
+            self.right_panel.add_video(video_path, video_relative_path, self.cache_manager)
+
+    def show_default_favorites(self):
+        """显示默认收藏夹的视频列表"""
+        self.current_tab = 1
+        self.right_panel.clear_videos()
+
+        if not self.cache_manager:
+            self.right_panel.set_title("⭐ 默认收藏夹")
+            return
+
+        fav_videos = self.cache_manager.get_favorite_videos()
+        self.right_panel.set_title(f"⭐ 默认收藏夹 ({len(fav_videos)} 个视频)")
+
+        for video_path in fav_videos:
+            video_relative_path = os.path.relpath(video_path, self.root_folder).replace('\\', '/')
             self.right_panel.add_video(video_path, video_relative_path, self.cache_manager)
 
     def closeEvent(self, event):
