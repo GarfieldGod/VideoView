@@ -1,0 +1,110 @@
+"""缩略图生成（使用 cv2）"""
+
+import os
+import cv2
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import Qt
+
+
+# 缩略图大小
+THUMBNAIL_SIZE_COLLECTION = (200, int(200 * 16 / 9))   # 收藏夹列表
+THUMBNAIL_SIZE_VIDEO = (560, int(560 * 16 / 9))         # 视频预览网格
+
+
+def generate_video_thumbnail_file(video_path, target_width, target_height, cache_path):
+    """生成视频缩略图并保存到缓存文件 - 仅使用 cv2
+
+    按 9:16 比例从视频中间裁剪
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise Exception("无法打开视频")
+
+    video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        cap.release()
+        raise Exception("视频帧数无效")
+
+    frame_idx = total_frames // 2
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+
+    ret, frame = cap.read()
+    cap.release()
+
+    if not ret or frame is None:
+        raise Exception("无法读取视频帧")
+
+    video_aspect = video_width / video_height
+    target_aspect = 9 / 16
+
+    if abs(video_aspect - target_aspect) < 0.01:
+        frame = cv2.resize(frame, (target_width, target_height))
+    elif video_aspect > target_aspect:
+        crop_width = int(video_height * 9 / 16)
+        crop_x = (video_width - crop_width) // 2
+        frame = frame[:, crop_x:crop_x + crop_width]
+        frame = cv2.resize(frame, (target_width, target_height))
+    else:
+        crop_height = int(video_width * 16 / 9)
+        crop_y = (video_height - crop_height) // 2
+        frame = frame[crop_y:crop_y + crop_height, :]
+        frame = cv2.resize(frame, (target_width, target_height))
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    cv2.imwrite(cache_path, frame)
+
+
+def generate_video_thumbnail(video_path, target_width, target_height=None, cache_path=None):
+    """生成视频缩略图，按 9:16 比例从视频中间裁剪"""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise Exception("无法打开视频")
+
+    video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        cap.release()
+        raise Exception("视频帧数无效")
+
+    frame_idx = total_frames // 2
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+
+    ret, frame = cap.read()
+    cap.release()
+
+    if not ret or frame is None:
+        raise Exception("无法读取视频帧")
+
+    if target_height is None:
+        target_height = int(target_width * 16 / 9)
+
+    if abs(video_width / video_height - 9 / 16) < 0.01:
+        frame = cv2.resize(frame, (target_width, target_height))
+    else:
+        video_aspect = video_width / video_height
+        target_aspect = 9 / 16
+
+        if video_aspect > target_aspect:
+            crop_width = int(video_height * 9 / 16)
+            crop_x = (video_width - crop_width) // 2
+            frame = frame[:, crop_x:crop_x + crop_width]
+        else:
+            crop_height = int(video_width * 16 / 9)
+            crop_y = (video_height - crop_height) // 2
+            frame = frame[crop_y:crop_y + crop_height, :]
+
+        frame = cv2.resize(frame, (target_width, target_height))
+
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        cv2.imwrite(cache_path, frame)
+
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image = QImage(frame_rgb.data, target_width, target_height,
+                   target_width * 3, QImage.Format_RGB888).copy()
+    return QPixmap.fromImage(image)
