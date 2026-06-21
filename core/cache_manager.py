@@ -354,7 +354,12 @@ class CacheManager:
 
     def get_rotation(self, video_relative_path):
         normalized = video_relative_path.replace('\\', '/')
-        return int(self.rotations.get(normalized, 0))
+        val = self.rotations.get(normalized, 0)
+        if val != 0:
+            # 调试信息：仅在有旋转时打印，同时打印前 5 个 keys 以便排查路径不匹配
+            sample_keys = list(self.rotations.keys())[:5]
+            print(f"[CacheManager] get_rotation: lookup='{normalized}' -> {val} (stored keys sample: {sample_keys})")
+        return int(val)
 
     def set_rotation(self, video_relative_path, rotation_deg):
         normalized = video_relative_path.replace('\\', '/')

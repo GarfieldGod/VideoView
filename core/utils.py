@@ -75,7 +75,7 @@ if _VLC_DIR:
 # 尝试 import python-vlc
 try:
     import vlc as _vlc_module
-    _test_inst = _vlc_module.Instance("--no-xlib --quiet --no-video-title-show --no-osd -q")
+    _test_inst = _vlc_module.Instance("--no-xlib --quiet --no-video-title-show --no-osd -q --video-filter=transform --transform-type=90")
     if _test_inst is not None:
         _test_player = _test_inst.media_player_new()
         if _test_player is not None:

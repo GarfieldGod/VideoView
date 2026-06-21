@@ -129,12 +129,13 @@ class VideoPlayerWindow(QMainWindow):
     # 后端检测
     # ------------------------------------------------------------
     def _detect_backend(self):
-        """在 setup_ui() 之前调用，设置 self._backend"""
-        from core import has_vlc, get_vlc_instance
-        inst = get_vlc_instance()
-        if inst is not None:
+        """在 setup_ui() 之前调用，设置 self._backend。
+        不预先创建共享 Instance，改为在 _load_vlc 中根据视频的旋转角度
+        动态创建独立的 Instance（Instance 级 --video-filter=transform 才真正生效）。
+        """
+        from core import has_vlc
+        if has_vlc():
             self._backend = 'vlc'
-            self._init_vlc(inst)
             print("[VideoPlayerWindow] 使用 VLC 后端（流畅 + 有声音）")
         else:
             self._backend = 'opencv'
@@ -333,39 +334,50 @@ class VideoPlayerWindow(QMainWindow):
     # ------------------------------------------------------------
     # VLC 后端
     # ------------------------------------------------------------
-    def _init_vlc(self, inst):
-        """复用 core.utils 已验证过的 VLC Instance"""
+    def _vlc_create_instance(self, rotation_deg):
+        """创建一个全新的 VLC Instance，把旋转角度写进 Instance 级参数。
+
+        这是唯一被广泛验证有效的 VLC 旋转方式：
+          --video-filter=transform --transform-type=90 (或 180 / 270)
+        """
         try:
-            self._vlc_inst = inst
-            self._vlc_player = self._vlc_inst.media_player_new()
-            if self._vlc_player is None:
-                self._backend = 'opencv'
-                return
-            self._vlc_timer = QTimer(self)
-            self._vlc_timer.timeout.connect(self._on_vlc_tick)
-            self._vlc_timer.start(250)
+            import vlc as _vlc_mod
         except Exception as e:
-            print(f"[VideoPlayerWindow] VLC 初始化失败: {e}")
-            self._backend = 'opencv'
+            print(f"[VideoPlayerWindow] 无法导入 vlc 模块: {e}")
+            return None
+
+        deg = int(rotation_deg) % 360
+        base = "--no-xlib --quiet --no-video-title-show --no-osd -q"
+        if deg == 90:
+            args = base + " --video-filter=transform --transform-type=90"
+        elif deg == 180:
+            args = base + " --video-filter=transform --transform-type=180"
+        elif deg == 270:
+            args = base + " --video-filter=transform --transform-type=270"
+        else:
+            args = base
+
+        try:
+            inst = _vlc_mod.Instance(args)
+        except Exception as e:
+            print(f"[VideoPlayerWindow] _vlc_create_instance 异常: {e}")
+            inst = None
+
+        if inst is None:
+            try:
+                inst = _vlc_mod.Instance("--no-xlib --quiet -q")
+            except Exception:
+                inst = None
+            print(f"[VideoPlayerWindow] 回退：创建无旋转参数的 VLC Instance（rotation={deg}° args 不生效）")
+        else:
+            print(f"[VideoPlayerWindow] VLC Instance 创建成功，rotation={deg}°（args: {args}）")
+        return inst
 
     def _vlc_build_media(self, abs_path, rotation_deg=0):
-        """创建 VLC Media，并在需要旋转时注入 transform 滤镜
-
-        type 映射：0 → 90°顺时针, 1 → 180°, 2 → 270°顺时针
-        rotation_deg=0 时不注入任何滤镜（保持原始方向）
-        """
-        media = self._vlc_inst.media_new(abs_path)
-        if media is None:
+        """创建 VLC Media —— 旋转参数已经在 Instance 级别设置，这里不需要额外处理。"""
+        if self._vlc_inst is None:
             return None
-        deg = int(rotation_deg) % 360
-        ttype_map = {90: 0, 180: 1, 270: 2}
-        ttype = ttype_map.get(deg, -1)
-        if ttype >= 0:
-            try:
-                media.add_option(f":video-filter=transform{{type={ttype}}}")
-                print(f"[VideoPlayerWindow] VLC 创建媒体（旋转 {deg}°）")
-            except Exception as e:
-                print(f"[VideoPlayerWindow] add_option 旋转滤镜失败: {e}")
+        media = self._vlc_inst.media_new(abs_path)
         return media
 
     def _on_vlc_tick(self):
@@ -375,7 +387,8 @@ class VideoPlayerWindow(QMainWindow):
         try:
             state = self._vlc_player.get_state()
             if state == 7:  # Error
-                self._vlc_timer.stop()
+                if self._vlc_timer is not None:
+                    self._vlc_timer.stop()
                 self._backend = 'opencv'
                 abs_path = self.video_paths[self.current_index][0] if 0 <= self.current_index < len(self.video_paths) else None
                 if abs_path and not self._closed:
@@ -417,9 +430,17 @@ class VideoPlayerWindow(QMainWindow):
 
         if self.cache_manager is not None:
             try:
-                self._rotation = int(self.cache_manager.get_rotation(rel_path)) % 360
-            except Exception:
+                raw = self.cache_manager.get_rotation(rel_path)
+                self._rotation = int(raw) % 360
+                if self._rotation != 0:
+                    print(f"[VideoPlayerWindow] 从缓存读取旋转: rel='{rel_path}' raw={raw} deg={self._rotation}")
+                else:
+                    print(f"[VideoPlayerWindow] 从缓存读取旋转: rel='{rel_path}' raw={raw} (无旋转)")
+            except Exception as e:
+                print(f"[VideoPlayerWindow] 读取旋转缓存失败: {e}")
                 self._rotation = 0
+        else:
+            print(f"[VideoPlayerWindow] cache_manager 为 None，无法读取旋转缓存")
 
         # 记录为最近一次播放的视频（写入根目录 .videoview/config.json）
         self._save_last_played(rel_path, abs_path)
@@ -469,13 +490,14 @@ class VideoPlayerWindow(QMainWindow):
         if self._closing or self._closed:
             return
         try:
-            if self._vlc_player is None:
-                self._load_cv(abs_path)
-                return
-
-            self._vlc_timer.stop()
+            if self._vlc_timer is not None:
+                self._vlc_timer.stop()
+            else:
+                self._vlc_timer = QTimer(self)
+                self._vlc_timer.timeout.connect(self._on_vlc_tick)
             try:
-                self._vlc_player.stop()
+                if self._vlc_player is not None:
+                    self._vlc_player.stop()
             except Exception:
                 pass
 
@@ -487,6 +509,37 @@ class VideoPlayerWindow(QMainWindow):
                     pass
                 self._vlc_widget.winId()
                 self._vlc_widget.show()
+
+            # 2a) 销毁旧的 instance/player（释放资源），然后创建带旋转参数的新 VLC Instance
+            try:
+                if self._vlc_player is not None:
+                    try:
+                        self._vlc_player.stop()
+                    except Exception:
+                        pass
+                    try:
+                        self._vlc_player.release()
+                    except Exception:
+                        pass
+                    self._vlc_player = None
+            except Exception:
+                pass
+            try:
+                if self._vlc_inst is not None:
+                    try:
+                        self._vlc_inst.release()
+                    except Exception:
+                        pass
+                    self._vlc_inst = None
+            except Exception:
+                pass
+
+            self._vlc_inst = self._vlc_create_instance(self._rotation)
+            if self._vlc_inst is None:
+                raise RuntimeError("VLC instance 创建失败")
+            self._vlc_player = self._vlc_inst.media_player_new()
+            if self._vlc_player is None:
+                raise RuntimeError("VLC media_player 创建失败")
 
             # 2) 创建带旋转滤镜的 Media，set_media
             media = self._vlc_build_media(abs_path, self._rotation)
