@@ -51,6 +51,7 @@ class VideoPlayerWindow(QMainWindow):
 
         # OpenCV 回退
         self._cv_cap = None
+        self._cv_attrs_saved = None  # 记录视频文件原始 Windows 属性（打开隐藏文件时保存）
         self._cv_timer = None
         self._cv_fps = 30.0
 
@@ -71,7 +72,7 @@ class VideoPlayerWindow(QMainWindow):
 
         # 延迟加载放到 showEvent 中
         self._pending_load = (start_index,)
-        self.showMaximized()
+        self._restore_window_state()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -83,6 +84,37 @@ class VideoPlayerWindow(QMainWindow):
             timer.timeout.connect(lambda: self.load_video(idx))
             self._pending_timers.append(timer)
             timer.start(50)
+
+    def _restore_window_state(self):
+        """从 app_config.json 恢复播放器窗口的状态"""
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtWidgets import QDesktopWidget
+        from core import get_window_state
+        state = get_window_state('player')
+        if state is None:
+            # 首次打开播放器：默认最大化
+            self.showMaximized()
+            return
+        try:
+            w = max(600, state['width'])
+            h = max(400, state['height'])
+            self.resize(w, h)
+            try:
+                screen = QDesktopWidget().availableGeometry()
+                x = max(screen.left(), min(state['x'], screen.right() - 200))
+                y = max(screen.top(), min(state['y'], screen.bottom() - 100))
+                self.move(x, y)
+            except Exception:
+                pass
+            if state.get('maximized'):
+                self.showMaximized()
+            elif state.get('minimized'):
+                self.showMinimized()
+            else:
+                self.show()
+        except Exception as e:
+            print(f"恢复播放器窗口状态失败: {e}")
+            self.showMaximized()
 
     # ------------------------------------------------------------
     # 后端检测
@@ -457,17 +489,50 @@ class VideoPlayerWindow(QMainWindow):
                 except Exception:
                     pass
                 self._cv_cap = None
+            if self._cv_attrs_saved:
+                try:
+                    from core.utils import _restore_file_attributes
+                    _restore_file_attributes(self._cv_attrs_saved)
+                except Exception:
+                    pass
+                self._cv_attrs_saved = None
 
             self._video_stack.setCurrentWidget(self._display_label)
             self._display_label.clear()
             self._display_label.setText("加载中...")
 
-            cap = cv2.VideoCapture(abs_path)
-            if not cap.isOpened():
-                cap.release()
+            # ---- 兼容 Windows 隐藏/系统属性的视频文件 + 中文/特殊字符路径 ----
+            from core.utils import (
+                _is_file_entry_readable,
+                _restore_file_attributes,
+                _as_cv2_safe_path,
+            )
+            safe_path = _as_cv2_safe_path(abs_path)
+
+            cap = cv2.VideoCapture(safe_path)
+            saved_attrs = None
+            if cap is None or not cap.isOpened():
+                # 常规打开失败，尝试临时去除隐藏/系统属性后重试
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                saved_attrs = _is_file_entry_readable(abs_path)
+                cap = cv2.VideoCapture(_as_cv2_safe_path(abs_path))
+
+            if cap is None or not cap.isOpened():
+                try:
+                    if cap is not None:
+                        cap.release()
+                except Exception:
+                    pass
+                # 恢复属性（如果有修改）
+                _restore_file_attributes(saved_attrs)
                 self._display_label.setText("无法打开视频文件：\n" + os.path.basename(abs_path))
                 return
             self._cv_cap = cap
+            self._cv_attrs_saved = saved_attrs
 
             try:
                 fps = float(cap.get(cv2.CAP_PROP_FPS))
@@ -873,6 +938,14 @@ class VideoPlayerWindow(QMainWindow):
         self._seek_to(target)
 
     def closeEvent(self, event):
+        # 第一步：先保存窗口状态到 app_config.json，然后隐藏窗口并异步释放资源
+        if not getattr(self, '_closing', False):
+            try:
+                from core import save_window_state
+                save_window_state(self, 'player')
+            except Exception as e:
+                print(f"保存播放器窗口状态失败: {e}")
+
         # 第一步：只设置标志、停止所有定时器、隐藏窗口，然后立即返回
         # 避免在主线程执行可能阻塞的资源释放操作
         if self._closing:
@@ -951,6 +1024,14 @@ class VideoPlayerWindow(QMainWindow):
             except Exception:
                 pass
         self._cv_cap = None
+        # 恢复文件原始 Windows 属性（若是隐藏/系统属性的视频）
+        if getattr(self, '_cv_attrs_saved', None):
+            try:
+                from core.utils import _restore_file_attributes
+                _restore_file_attributes(self._cv_attrs_saved)
+            except Exception:
+                pass
+            self._cv_attrs_saved = None
         # 清理显示引用
         try:
             if hasattr(self, '_display_label') and self._display_label:

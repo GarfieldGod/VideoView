@@ -12,6 +12,8 @@ import os
 import json
 import hashlib
 
+from core.config import makedirs_hidden, ensure_hidden, open_for_write
+
 
 def path_hash(path):
     """计算路径的确定性哈希值（使用 MD5）"""
@@ -85,9 +87,11 @@ class CacheManager:
 
     def _save_manifest(self):
         try:
-            os.makedirs(self.cache_dir, exist_ok=True)
-            with open(self.manifest_path, 'w', encoding='utf-8') as f:
+            makedirs_hidden(self.cache_dir)
+            with open_for_write(self.manifest_path, 'w', encoding='utf-8') as f:
                 json.dump(self.manifest, f, ensure_ascii=False, indent=2)
+            # 不再 ensure_hidden(manifest_path)：只隐藏目录，不隐藏文件，
+            # 避免某些 Windows 环境下写入隐藏文件报 Permission denied。
         except Exception as e:
             print(f"[CacheManager] 保存缓存清单失败: {e}")
 
@@ -107,9 +111,10 @@ class CacheManager:
 
     def save_favorites(self):
         try:
-            os.makedirs(self.cache_dir, exist_ok=True)
-            with open(self.favorites_path, 'w', encoding='utf-8') as f:
+            makedirs_hidden(self.cache_dir)
+            with open_for_write(self.favorites_path, 'w', encoding='utf-8') as f:
                 json.dump(self.favorites, f, ensure_ascii=False, indent=2)
+            # 不再 ensure_hidden(favorites_path)：同上，仅隐藏目录
         except Exception as e:
             print(f"[CacheManager] 保存收藏列表失败: {e}")
 
@@ -224,6 +229,57 @@ class CacheManager:
         fav_list = self.favorites.get('collections', {}).get('默认收藏夹', [])
         return len([f for f in fav_list if os.path.exists(os.path.join(self.base_path, f))])
 
+    # ------------------------------------------------------------
+    # 命名收藏夹（.videoview/favorites.json → collections 字典支持多个命名收藏夹）
+    # ------------------------------------------------------------
+
+    def get_collection_names(self):
+        """返回所有非默认收藏夹的名称（除"默认收藏夹"外的其他命名收藏夹）"""
+        all_names = list(self.favorites.get('collections', {}).keys())
+        # 默认收藏夹永远在首位
+        result = []
+        if '默认收藏夹' in all_names:
+            result.append('默认收藏夹')
+            all_names.remove('默认收藏夹')
+        result.extend(sorted(all_names))
+        return result
+
+    def create_named_collection(self, name, video_relative_paths):
+        """创建一个命名收藏夹（若已存在则覆盖）"""
+        collections = self.favorites.setdefault('collections', {})
+        normalized = []
+        for v in video_relative_paths:
+            nv = self._strip_prefix(v)
+            if nv and nv not in normalized:
+                normalized.append(nv)
+        collections[name] = normalized
+        self.save_favorites()
+
+    def get_named_collection_videos(self, name):
+        """获取命名收藏夹中的所有视频（返回绝对路径）"""
+        collections = self.favorites.get('collections', {})
+        if name not in collections:
+            return []
+        result = []
+        for rel_path in collections[name]:
+            abs_path = os.path.join(self.base_path, rel_path)
+            if os.path.exists(abs_path):
+                result.append(abs_path)
+        return result
+
+    def get_named_collection_count(self, name):
+        """获取命名收藏夹中的视频数量"""
+        return len(self.get_named_collection_videos(name))
+
+    def remove_named_collection(self, name):
+        """删除一个命名收藏夹（不能删除默认收藏夹）"""
+        if name == '默认收藏夹':
+            return
+        collections = self.favorites.get('collections', {})
+        if name in collections:
+            del collections[name]
+            self.save_favorites()
+
     # ===== 收藏夹标记功能 =====
     def _load_marked_collections(self):
         marked_path = os.path.join(os.path.dirname(self.cache_dir), 'marked_collections.json')
@@ -239,9 +295,10 @@ class CacheManager:
 
     def save_marked_collections(self):
         try:
-            os.makedirs(os.path.dirname(self.marked_path), exist_ok=True)
-            with open(self.marked_path, 'w', encoding='utf-8') as f:
+            makedirs_hidden(os.path.dirname(self.marked_path))
+            with open_for_write(self.marked_path, 'w', encoding='utf-8') as f:
                 json.dump({'marked': sorted(list(self.marked_collections))}, f, ensure_ascii=False, indent=2)
+            # 不再 ensure_hidden(self.marked_path)：同上，仅隐藏目录
         except Exception as e:
             print(f"[CacheManager] 保存标记列表失败: {e}")
 
@@ -284,9 +341,10 @@ class CacheManager:
 
     def save_rotations(self):
         try:
-            os.makedirs(os.path.dirname(self.rotation_path), exist_ok=True)
-            with open(self.rotation_path, 'w', encoding='utf-8') as f:
+            makedirs_hidden(os.path.dirname(self.rotation_path))
+            with open_for_write(self.rotation_path, 'w', encoding='utf-8') as f:
                 json.dump({'rotations': self.rotations}, f, ensure_ascii=False, indent=2)
+            # 不再 ensure_hidden(self.rotation_path)：同上，仅隐藏目录
         except Exception as e:
             print(f"[CacheManager] 保存旋转列表失败: {e}")
 

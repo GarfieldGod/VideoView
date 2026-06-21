@@ -116,6 +116,8 @@ class CollectionItem(QWidget):
                  is_marked=False, parent=None, on_mark_changed=None,
                  cache_manager=None, video_relative_path=None,
                  on_thumbnail_ready=None, on_batch_rotate=None,
+                 on_batch_favorite=None,
+                 on_batch_unfavorite=None,
                  cache_manager_resolver=None):
         super().__init__(parent)
         self.name = name
@@ -127,6 +129,8 @@ class CollectionItem(QWidget):
         self.video_relative_path = video_relative_path
         self.on_thumbnail_ready = on_thumbnail_ready
         self.on_batch_rotate = on_batch_rotate
+        self.on_batch_favorite = on_batch_favorite
+        self.on_batch_unfavorite = on_batch_unfavorite
         # 缓存管理器解析器：返回给定 rel_path 应使用的 CacheManager（支持子目录独立配置）
         self.cache_manager_resolver = cache_manager_resolver
         self._thumbnail_loaded = False
@@ -275,9 +279,26 @@ class CollectionItem(QWidget):
         layout.addWidget(self.name_label, alignment=Qt.AlignCenter)
         layout.addWidget(self.count_label, alignment=Qt.AlignCenter)
 
-        # 右键菜单支持（批量旋转整个收藏夹的视频）
+        # 右键菜单支持（批量旋转整个收藏夹的视频 + 批量收藏）
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
+
+    def set_selected_state(self, is_selected):
+        """根据选中状态调整文字颜色：选中 → 深色文字（白色背景），未选中 → 浅色文字（深色背景）"""
+        if is_selected:
+            self.name_label.setStyleSheet(
+                "QLabel {color: #222; font-size: 20px; font-weight: bold;}"
+            )
+            self.count_label.setStyleSheet(
+                "QLabel {color: #555; font-size: 16px;}"
+            )
+        else:
+            self.name_label.setStyleSheet(
+                "QLabel {color: #fff; font-size: 20px; font-weight: bold;}"
+            )
+            self.count_label.setStyleSheet(
+                "QLabel {color: #aaa; font-size: 16px;}"
+            )
 
     def _update_mark_button_style(self):
         if self.is_marked:
@@ -306,21 +327,43 @@ class CollectionItem(QWidget):
             self.on_mark_changed(self.name, self.is_marked)
 
     def _on_context_menu(self, pos):
-        """右键菜单：批量旋转整个收藏夹的视频（左旋90°/右旋90°）"""
+        """右键菜单：批量收藏 / 批量取消收藏 / 批量旋转（左旋90°/右旋90°）
+
+        - on_batch_favorite → 点击"批量收藏到最爱
+        - on_batch_unfavorite → 批量取消该收藏夹
+        - on_batch_rotate → 批量旋转该收藏夹
+        """
         try:
-            if not self.on_batch_rotate:
+            if not self.on_batch_rotate and not self.on_batch_favorite and not self.on_batch_unfavorite:
                 return
             menu = QMenu(self)
             menu.setStyleSheet(MENU_QSS)
-            action_left = QAction(f"↺ 左旋 90°（{self.video_count} 个视频）", self)
-            action_left.triggered.connect(lambda: self.on_batch_rotate(self.name, -90))
-            menu.addAction(action_left)
+            has_items = False
+            if self.on_batch_unfavorite:
+                action_unfav = QAction(f"✕ 批量取消收藏（{self.video_count} 个视频）", self)
+                action_unfav.triggered.connect(lambda: self.on_batch_unfavorite(self.name))
+                menu.addAction(action_unfav)
+                has_items = True
+            if self.on_batch_favorite:
+                if has_items:
+                    menu.addSeparator()
+                action_fav = QAction(f"⭐ 批量收藏到最爱（{self.video_count} 个视频）", self)
+                action_fav.triggered.connect(lambda: self.on_batch_favorite(self.name))
+                menu.addAction(action_fav)
+                has_items = True
+            if self.on_batch_rotate:
+                if has_items:
+                    menu.addSeparator()
+                action_left = QAction(f"↺ 左旋 90°（{self.video_count} 个视频）", self)
+                action_left.triggered.connect(lambda: self.on_batch_rotate(self.name, -90))
+                menu.addAction(action_left)
+                action_right = QAction(f"↻ 右旋 90°（{self.video_count} 个视频）", self)
+                action_right.triggered.connect(lambda: self.on_batch_rotate(self.name, 90))
+                menu.addAction(action_right)
+                has_items = True
 
-            action_right = QAction(f"↻ 右旋 90°（{self.video_count} 个视频）", self)
-            action_right.triggered.connect(lambda: self.on_batch_rotate(self.name, 90))
-            menu.addAction(action_right)
-
-            menu.exec_(self.mapToGlobal(pos))
+            if has_items:
+                menu.exec_(self.mapToGlobal(pos))
         except Exception as e:
             print(f"[CollectionItem] 右键菜单异常: {e}")
 
@@ -640,12 +683,15 @@ class CollectionListWidget(QListWidget):
         self.setStyleSheet(
             "QListWidget {background-color: #1a1a2e; border: none; padding: 10px;}"
             "QListWidget::item {background-color: transparent; border-radius: 8px; padding: 8px;}"
-            "QListWidget::item:selected {background-color: #2d2d44; border: 1px solid #4a4a6a;}"
+            "QListWidget::item:selected {background-color: #ffffff; "
+            "border: 2px solid #4a4a6a; border-radius: 8px; padding: 8px;}"
             "QListWidget::item:hover {background-color: #252540;}"
+            "QListWidget::item:selected:hover {background-color: #ffffff;}"
         )
         self.setSpacing(8)
         self.setFlow(QListView.TopToBottom)
         self.setResizeMode(QListWidget.Fixed)
+        self.itemSelectionChanged.connect(self._on_selection_changed)
 
         # 用 QTimer 去抖：滚动/调整大小后只做一次批量刷新
         self._pending_refresh_timer = QTimer(self)
@@ -663,6 +709,17 @@ class CollectionListWidget(QListWidget):
             )
         except Exception:
             pass
+
+    def _on_selection_changed(self):
+        """选中项变化时：让选中项显示深色文字（白色背景），未选中项显示浅色文字"""
+        for i in range(self.count()):
+            item = self.item(i)
+            if item is None:
+                continue
+            widget = self.itemWidget(item)
+            if widget is None or not hasattr(widget, 'set_selected_state'):
+                continue
+            widget.set_selected_state(item.isSelected())
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -713,6 +770,10 @@ class VideoGridWidget(QWidget):
         self.video_items = {}
         self.on_favorite_changed_callback = None
         self.on_double_clicked_callback = None
+        # 上下切换收藏夹回调：on_prev_collection() / on_next_collection()
+        # 由主窗口绑定，用于标题栏左右三角形按钮
+        self.on_prev_collection = None
+        self.on_next_collection = None
         self.setup_ui()
 
         # 视口刷新：滚动/尺寸变化后延迟合并刷新，避免高频率计算
@@ -792,11 +853,58 @@ class VideoGridWidget(QWidget):
         self.main_layout.setContentsMargins(20, 20, 20, 20)
         self.main_layout.setSpacing(16)
 
+        # ========== 标题栏：◀ 📁 根目录名 : 收藏夹名 (XX 个视频) ▶ ==========
+        self.header_widget = QWidget()
+        self.header_widget.setStyleSheet("background-color: transparent;")
+        header_layout = QHBoxLayout(self.header_widget)
+        header_layout.setContentsMargins(0, 10, 0, 10)
+        header_layout.setSpacing(12)
+
+        # ◀ 上一个收藏夹按钮
+        self.prev_btn = QPushButton("◀")
+        self.prev_btn.setFixedSize(56, 56)
+        self.prev_btn.setCursor(Qt.PointingHandCursor)
+        self.prev_btn.setStyleSheet(
+            "QPushButton {background-color: #2a2a44; color: #fff; border: 2px solid #4a4a6a;"
+            "border-radius: 28px; font-size: 22px; font-weight: bold;}"
+            "QPushButton:hover {background-color: #3a3a5a; color: #ffcc00;}"
+            "QPushButton:disabled {background-color: #1a1a2e; color: #555; border-color: #2a2a4a;}"
+        )
+        self.prev_btn.clicked.connect(self._on_prev_clicked)
+
+        # 图标
+        self.icon_label = QLabel("📁")
+        self.icon_label.setStyleSheet(
+            "QLabel {color: #fff; font-size: 30px;}"
+        )
+        self.icon_label.setAlignment(Qt.AlignCenter)
+        self.icon_label.setFixedWidth(44)
+
+        # 主标题：根目录名 : 收藏夹名 (XX 个视频)
         self.title_label = QLabel("全部视频")
         self.title_label.setStyleSheet(
-            "QLabel {color: #fff; font-size: 34px; font-weight: bold; padding: 10px 0;}"
+            "QLabel {color: #fff; font-size: 28px; font-weight: bold; padding: 0px;}"
         )
+        self.title_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
+        # ▶ 下一个收藏夹按钮
+        self.next_btn = QPushButton("▶")
+        self.next_btn.setFixedSize(56, 56)
+        self.next_btn.setCursor(Qt.PointingHandCursor)
+        self.next_btn.setStyleSheet(
+            "QPushButton {background-color: #2a2a44; color: #fff; border: 2px solid #4a4a6a;"
+            "border-radius: 28px; font-size: 22px; font-weight: bold;}"
+            "QPushButton:hover {background-color: #3a3a5a; color: #ffcc00;}"
+            "QPushButton:disabled {background-color: #1a1a2e; color: #555; border-color: #2a2a4a;}"
+        )
+        self.next_btn.clicked.connect(self._on_next_clicked)
+
+        header_layout.addWidget(self.prev_btn, 0, Qt.AlignVCenter)
+        header_layout.addWidget(self.icon_label, 0, Qt.AlignVCenter)
+        header_layout.addWidget(self.title_label, 1, Qt.AlignVCenter)
+        header_layout.addWidget(self.next_btn, 0, Qt.AlignVCenter)
+
+        # ========== 滚动区域 ==========
         self.scroll_area = QScrollArea()
         self.scroll_area.setStyleSheet(
             "QScrollArea {background-color: #16162a; border: none;}"
@@ -812,18 +920,61 @@ class VideoGridWidget(QWidget):
         self.flow_layout = FlowLayout(self.content_widget, 10, 16)
 
         self.scroll_area.setWidget(self.content_widget)
-        self.main_layout.addWidget(self.title_label)
+        self.main_layout.addWidget(self.header_widget)
         self.main_layout.addWidget(self.scroll_area)
 
+    def _on_prev_clicked(self):
+        if self.on_prev_collection:
+            self.on_prev_collection()
+
+    def _on_next_clicked(self):
+        if self.on_next_collection:
+            self.on_next_collection()
+
     def set_title(self, title):
+        """兼容旧接口：直接设置文字（不包含图标/根目录信息时使用）"""
         self.title_label.setText(title)
 
+    def set_title_header(self, icon, root_name, collection_name, video_count,
+                          can_prev=True, can_next=True):
+        """设置完整标题栏：◀ 图标 根目录名 : 收藏夹名 (XX 个视频) ▶"""
+        try:
+            self.icon_label.setText(icon if icon else "📁")
+            if root_name and collection_name:
+                # 只显示根目录的最后一级名，避免过长
+                display_root = os.path.basename(root_name.rstrip('/')) or root_name
+                self.title_label.setText(f"{display_root} : {collection_name} ({video_count} 个视频)")
+            elif collection_name:
+                self.title_label.setText(f"{collection_name} ({video_count} 个视频)")
+            else:
+                self.title_label.setText(f"全部视频 ({video_count} 个视频)")
+        except Exception:
+            self.title_label.setText(f"{collection_name or ''} ({video_count} 个视频)")
+        # 根据 can_prev/can_next 控制按钮可用性
+        try:
+            self.prev_btn.setEnabled(bool(can_prev))
+            self.next_btn.setEnabled(bool(can_next))
+        except Exception:
+            pass
+
     def clear_videos(self):
+        """清空视频网格并将滚动条重置到最上方（切换收藏夹时调用）"""
         self.video_items.clear()
         while self.flow_layout.count():
             item = self.flow_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        # 重置滚动条到最顶部，避免切换收藏夹后保持在上一位置
+        try:
+            if hasattr(self, 'scroll_area') and self.scroll_area is not None:
+                vsb = self.scroll_area.verticalScrollBar()
+                if vsb is not None:
+                    vsb.setValue(vsb.minimum() if hasattr(vsb, 'minimum') else 0)
+                hsb = self.scroll_area.horizontalScrollBar()
+                if hsb is not None:
+                    hsb.setValue(hsb.minimum() if hasattr(hsb, 'minimum') else 0)
+        except Exception:
+            pass
 
     def find_main_window(self):
         from PyQt5.QtWidgets import QMainWindow

@@ -187,25 +187,158 @@ def is_video_file(filename):
     return ext in VIDEO_EXTENSIONS
 
 
+# Windows 文件属性常量（用于兼容 os.scandir 的 DirEntry.stat().st_file_attributes）
+_FILE_ATTRIBUTE_HIDDEN = 0x2
+_FILE_ATTRIBUTE_SYSTEM = 0x4
+_FILE_ATTRIBUTE_DIRECTORY = 0x10
+
+
+def _as_cv2_safe_path(path):
+    """返回可以被 cv2.VideoCapture / cv2.imwrite 等 API 安全使用的路径。
+
+    Windows 下 OpenCV 的 C API 用 ANSI 编码解析路径，遇到中文路径会失败。
+    这里尝试用 kernel32!GetShortPathNameW 获取 DOS 8.3 短路径（纯 ASCII）。
+    失败或非 Windows 平台返回原路径。
+    """
+    if not path:
+        return path
+    if os.name != 'nt':
+        return path
+    try:
+        import ctypes
+        GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        abs_path = os.path.abspath(str(path))
+        # 第一次调用：获取需要的缓冲区大小（含结尾空字符）
+        needed = GetShortPathNameW(abs_path, None, 0)
+        if needed <= 0:
+            return path  # 获取失败，退还原路径
+        buf = ctypes.create_unicode_buffer(needed)
+        real_size = GetShortPathNameW(abs_path, buf, needed)
+        if real_size <= 0:
+            return path
+        short_path = buf.value
+        # 如果获取到的短路径有效，返回它
+        if short_path and os.path.exists(short_path):
+            return short_path
+        return path
+    except Exception:
+        return path
+
+
+def _is_windows_path(path):
+    """判断是否为 Windows 路径（基于系统或路径含有盘符前缀）"""
+    if os.name == 'nt':
+        return True
+    # 在非 Windows 系统上，若用户传入 Windows 风格路径（很少见），仍然保守返回 False
+    return False
+
+
+def _is_file_entry_readable(path):
+    """兼容 Windows 隐藏/系统属性：确保文件可读
+
+    在 Windows 上，cv2.VideoCapture 对带 FILE_ATTRIBUTE_HIDDEN 的文件
+    有时会打开失败。这里尝试临时去除隐藏/系统属性（失败时静默忽略），
+    调用方使用完后调用 _restore_file_attributes 恢复。
+
+    返回一个 dict 描述原始属性（非 Windows 或不支持时返回 None）。
+    """
+    if not _is_windows_path(path):
+        return None
+    try:
+        import ctypes
+        GetFileAttributesW = ctypes.windll.kernel32.GetFileAttributesW
+        SetFileAttributesW = ctypes.windll.kernel32.SetFileAttributesW
+        INVALID_FILE_ATTRIBUTES = -1
+
+        attrs = GetFileAttributesW(str(path))
+        if attrs == INVALID_FILE_ATTRIBUTES:
+            return None
+        # 如果有隐藏/系统属性，先临时去掉（以便 cv2/系统打开读取）
+        if attrs & (_FILE_ATTRIBUTE_HIDDEN | _FILE_ATTRIBUTE_SYSTEM):
+            new_attrs = attrs & ~(_FILE_ATTRIBUTE_HIDDEN | _FILE_ATTRIBUTE_SYSTEM)
+            if SetFileAttributesW(str(path), new_attrs) != 0:
+                return {"path": path, "attrs": attrs}
+        return None
+    except Exception:
+        return None
+
+
+def _restore_file_attributes(saved):
+    """恢复文件原始隐藏/系统属性"""
+    if not saved:
+        return
+    try:
+        import ctypes
+        SetFileAttributesW = ctypes.windll.kernel32.SetFileAttributesW
+        SetFileAttributesW(str(saved["path"]), saved["attrs"])
+    except Exception:
+        pass
+
+
 def scan_folder_for_videos(folder_path, recursive=False):
-    """扫描文件夹下的视频文件
+    """扫描文件夹下的视频文件（Windows 下会包含带隐藏属性的视频）
 
     Args:
         folder_path: 要扫描的文件夹路径
         recursive: 是否递归扫描子文件夹（默认 False，只扫描直接文件）
+
+    实现要点：
+    - 使用 os.scandir 替代 os.listdir/os.walk，获得 DirEntry
+      （在 Windows 上包含 st_file_attributes，能准确识别隐藏/系统属性）
+    - 不主动跳过隐藏/系统属性的文件或目录——用户可能需要扫描它们
+    - 仍然跳过 .videoview 等应用元数据目录
     """
     videos = []
-    if recursive:
-        for root, dirs, files in os.walk(folder_path):
-            for file in files:
-                if is_video_file(file):
-                    videos.append(os.path.join(root, file))
-    else:
-        # 只扫描直接文件，不递归进入子目录
-        for file in os.listdir(folder_path):
-            file_path = os.path.join(folder_path, file)
-            if os.path.isfile(file_path) and is_video_file(file):
-                videos.append(file_path)
+    try:
+        if recursive:
+            # 递归扫描：os.walk 在某些情况下会跳过「隐藏+系统」属性的目录，
+            # 这里手动实现基于 scandir 的递归确保覆盖。
+            stack = [folder_path]
+            while stack:
+                cur = stack.pop()
+                try:
+                    with os.scandir(cur) as it:
+                        for entry in it:
+                            name = entry.name
+                            # 跳过应用自己的元数据目录
+                            if name == '.videoview' or name.startswith('$'):
+                                continue
+                            try:
+                                if entry.is_file(follow_symlinks=False):
+                                    if is_video_file(name):
+                                        videos.append(entry.path)
+                                elif entry.is_dir(follow_symlinks=False):
+                                    stack.append(entry.path)
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+        else:
+            # 只扫描直接文件，不递归进入子目录
+            with os.scandir(folder_path) as it:
+                for entry in it:
+                    name = entry.name
+                    if name == '.videoview':
+                        continue
+                    try:
+                        if entry.is_file(follow_symlinks=False) and is_video_file(name):
+                            videos.append(entry.path)
+                    except Exception:
+                        continue
+    except Exception:
+        # scandir 失败时退化到 os.listdir，但仍然收集所有文件（不依赖隐藏属性）
+        try:
+            for file in os.listdir(folder_path):
+                if file == '.videoview':
+                    continue
+                file_path = os.path.join(folder_path, file)
+                try:
+                    if os.path.isfile(file_path) and is_video_file(file):
+                        videos.append(file_path)
+                except Exception:
+                    continue
+        except Exception:
+            pass
     return videos
 
 

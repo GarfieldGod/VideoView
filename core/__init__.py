@@ -28,6 +28,8 @@ from .config import (
     set_last_root_folder,
     get_volume,
     save_volume,
+    get_window_state,
+    save_window_state,
 )
 
 __all__ = [
@@ -54,4 +56,6 @@ __all__ = [
     "set_last_root_folder",
     "get_volume",
     "save_volume",
+    "get_window_state",
+    "save_window_state",
 ]
