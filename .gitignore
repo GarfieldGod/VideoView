@@ -27,8 +27,12 @@ __pycache__
 # 软件配置（用户相关）
 app_config.json
 
-# VLC 运行时（体积较大，由用户自行下载或脚本生成）
+# VLC 便携版（由用户自行下载或从官方安装包提取，体积较大 50-200MB）
 vlc/
+
+# VLC 下载临时目录
+vlc_new/
+_vlc_download.7z
 
 # 临时文件
 *.bak

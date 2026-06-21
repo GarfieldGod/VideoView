@@ -1,8 +1,12 @@
 """应用内播放器
 
-优先使用 VLC（流畅 + 有声音），VLC 不可用时降级到 OpenCV 逐帧播放。
+纯 VLC 渲染（硬件加速 + 有声音）：
+- VLC 旋转通过 Media 级别的 :video-filter=transform{type=N} 参数实现
+- type 映射：0 → 90°顺时针, 1 → 180°, 2 → 270°顺时针（逆时针 90°）
+- 播放中切换旋转：重建 Media 并 seek 到当前进度
+- VLC 不可用时回退到 OpenCV 逐帧播放
 
-播放控制：上一个/下一个/暂停/进度拖动/左旋/右旋/收藏。
+播放控制：上一个/下一个/暂停/进度拖动/左旋/右旋/收藏/音量。
 旋转角度自动持久化到 rotations.json。
 """
 
@@ -15,6 +19,7 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QStackedLayout,
     QLabel, QPushButton, QSlider, QApplication,
 )
+
 
 
 class VideoPlayerWindow(QMainWindow):
@@ -40,9 +45,9 @@ class VideoPlayerWindow(QMainWindow):
         self._is_playing = False
         self._slider_seeking = False
         self._muted = False
-        self._closed = False  # 窗口关闭标志，防止定时器在析构后触发
+        self._closed = False
 
-        # OpenCV 后端
+        # OpenCV 回退
         self._cv_cap = None
         self._cv_timer = None
         self._cv_fps = 30.0
@@ -51,16 +56,15 @@ class VideoPlayerWindow(QMainWindow):
         self._vlc_inst = None
         self._vlc_player = None
         self._vlc_timer = None
-        self._vlc_widget = None
 
-        # 必须先检测后端，再构建 UI（setup_ui 依赖 self._backend）
+        # 必须先检测后端，再构建 UI
         self._detect_backend()
-        # 音量从 app_config.json 读取（持久化），无 config 时默认 80
+        # 音量从 app_config.json 读取
         from core import get_volume
         self._volume = get_volume()
         self.setup_ui()
 
-        # 延迟加载放到 showEvent 中，此时窗口已渲染完毕，winId() 有效
+        # 延迟加载放到 showEvent 中
         self._pending_load = (start_index,)
         self.show()
 
@@ -100,32 +104,33 @@ class VideoPlayerWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # 视频显示区：一个容器 widget，内嵌 QStackedLayout，VLC widget 与 QLabel 同级切换
+        # 视频显示区
         self._video_container = QWidget()
         self._video_container.setStyleSheet("background-color:#000000;")
         self._video_container.setMinimumSize(640, 360)
-        stack = QStackedLayout(self._video_container)
-        stack.setContentsMargins(0, 0, 0, 0)
-        stack.setStackingMode(QStackedLayout.StackOne)
-        self._video_stack = stack
+        main_layout.addWidget(self._video_container, 1)
 
+        self._video_stack = QStackedLayout(self._video_container)
+        self._video_stack.setContentsMargins(0, 0, 0, 0)
+        self._video_stack.setStackingMode(QStackedLayout.StackOne)
+
+        # QLabel：OpenCV 回退或加载提示
         self._display_label = QLabel()
         self._display_label.setAlignment(Qt.AlignCenter)
         self._display_label.setStyleSheet(
             "background-color:#000000; color:#888; font-size:18px;"
         )
         self._display_label.setText("加载中...")
-        stack.addWidget(self._display_label)
+        self._video_stack.addWidget(self._display_label)
 
+        # VLC widget：VLC 直连渲染（绑定原生窗口）
         if self._backend == 'vlc':
             self._vlc_widget = QWidget(self._video_container)
             self._vlc_widget.setAttribute(Qt.WA_NativeWindow, True)
             self._vlc_widget.setStyleSheet("background-color:#000000;")
-            stack.addWidget(self._vlc_widget)
+            self._video_stack.addWidget(self._vlc_widget)
         else:
             self._vlc_widget = None
-
-        main_layout.addWidget(self._video_container, 1)
 
         # 底部控制栏
         ctrl = QWidget()
@@ -139,13 +144,11 @@ class VideoPlayerWindow(QMainWindow):
         self.time_current = QLabel("00:00")
         self.time_current.setStyleSheet("color:#bbb; font-size:13px;")
         self.progress_slider = QSlider(Qt.Horizontal)
-        # 初始范围用 0~1，避免 total=0 时 setRange(0,0) 导致异常
         self.progress_slider.setRange(0, 1)
         self.progress_slider.setValue(0)
         self.progress_slider.sliderPressed.connect(self._on_slider_pressed)
         self.progress_slider.sliderReleased.connect(self._on_slider_released)
         self.progress_slider.sliderMoved.connect(self._on_slider_moved)
-        # 安装事件过滤器：点击进度条任意位置直接跳转
         self.progress_slider.installEventFilter(self)
         self.time_total = QLabel("00:00")
         self.time_total.setStyleSheet("color:#bbb; font-size:13px;")
@@ -224,13 +227,11 @@ class VideoPlayerWindow(QMainWindow):
         return btn
 
     def eventFilter(self, obj, event):
-        """事件过滤器：让进度条支持点击任意位置跳转"""
+        """进度条点击任意位置跳转"""
         if obj is self.progress_slider:
             etype = event.type()
             if etype == QEvent.MouseButtonPress:
-                # 根据鼠标点击位置计算目标毫秒值，并立即跳转
-                btn = event.button()
-                if btn == Qt.LeftButton:
+                if event.button() == Qt.LeftButton:
                     try:
                         pos_x = event.pos().x()
                         w = self.progress_slider.width()
@@ -242,7 +243,7 @@ class VideoPlayerWindow(QMainWindow):
                             self.progress_slider.setValue(target)
                             self._slider_seeking = True
                             self._seek_to(target)
-                            return True  # 消费事件，阻止默认 pageStep 行为
+                            return True
                     except Exception:
                         pass
             elif etype == QEvent.MouseButtonRelease:
@@ -250,82 +251,11 @@ class VideoPlayerWindow(QMainWindow):
                 return True
         return super().eventFilter(obj, event)
 
-    def _seek_to(self, target_ms):
-        """统一跳转入口：同时更新 VLC 或 OpenCV 播放位置"""
-        target_ms = max(0, int(target_ms))
-        if self._backend == 'vlc' and self._vlc_player:
-            try:
-                self._vlc_player.set_time(target_ms)
-            except Exception:
-                pass
-        elif self._cv_cap is not None:
-            try:
-                self._cv_cap.set(cv2.CAP_PROP_POS_MSEC, float(target_ms))
-            except Exception:
-                pass
-        try:
-            self._current_ms = target_ms
-            self.time_current.setText(self._format_ms(target_ms))
-        except Exception:
-            pass
-
-    def _apply_volume(self):
-        """把 self._volume 应用到 VLC 播放器并持久化"""
-        vol = 0 if self._muted else max(0, min(100, int(self._volume)))
-        try:
-            self.volume_slider.blockSignals(True)
-            self.volume_slider.setValue(vol if not self._muted else 0)
-        except Exception:
-            pass
-        finally:
-            try:
-                self.volume_slider.blockSignals(False)
-            except Exception:
-                pass
-        try:
-            self.volume_label.setText(str(vol))
-        except Exception:
-            pass
-        if self._backend == 'vlc' and self._vlc_player is not None:
-            try:
-                self._vlc_player.audio_set_volume(vol)
-            except Exception:
-                pass
-        # 持久化到 app_config.json
-        from core import save_volume
-        save_volume(vol if not self._muted else self._volume)
-
-    def _on_volume_changed(self, value):
-        self._volume = max(0, min(100, int(value)))
-        self._muted = False
-        try:
-            self.btn_mute.setText("🔊")
-        except Exception:
-            pass
-        self._apply_volume()
-
-    def _change_volume(self, delta):
-        self._muted = False
-        self._volume = max(0, min(100, int(self._volume) + int(delta)))
-        try:
-            self.btn_mute.setText("🔊")
-        except Exception:
-            pass
-        self._apply_volume()
-
-    def _toggle_mute(self):
-        self._muted = not self._muted
-        try:
-            self.btn_mute.setText("🔇" if self._muted else "🔊")
-        except Exception:
-            pass
-        self._apply_volume()
-
     # ------------------------------------------------------------
     # VLC 后端
     # ------------------------------------------------------------
     def _init_vlc(self, inst):
-        """复用 core.utils 已验证过的 VLC Instance，避免重复创建"""
+        """复用 core.utils 已验证过的 VLC Instance"""
         try:
             self._vlc_inst = inst
             self._vlc_player = self._vlc_inst.media_player_new()
@@ -339,61 +269,40 @@ class VideoPlayerWindow(QMainWindow):
             print(f"[VideoPlayerWindow] VLC 初始化失败: {e}")
             self._backend = 'opencv'
 
-    def _bind_vlc_window(self):
-        """把 VLC 视频输出绑定到 _vlc_widget 的 HWND"""
-        if self._vlc_widget is None or self._vlc_player is None:
-            return
-        try:
-            self._vlc_widget.winId()
-            self._vlc_player.set_hwnd(self._vlc_widget.winId())
-        except Exception as e:
-            print(f"[VideoPlayerWindow] set_hwnd 失败: {e}")
+    def _vlc_build_media(self, abs_path, rotation_deg=0):
+        """创建 VLC Media，并在需要旋转时注入 transform 滤镜
 
-    def _vlc_build_media(self, abs_path, rotation_deg):
-        """构造 VLC Media，并注入旋转滤镜（必须在 set_media 之前设置）"""
+        type 映射：0 → 90°顺时针, 1 → 180°, 2 → 270°顺时针
+        rotation_deg=0 时不注入任何滤镜（保持原始方向）
+        """
         media = self._vlc_inst.media_new(abs_path)
         if media is None:
             return None
-
         deg = int(rotation_deg) % 360
-        if deg > 0:
-            # transform 滤镜参数：type=0(90°顺时针) / 1(180°) / 2(90°逆时针) / 3(90°逆时针)
-            # 注意：VLC transform type: 0=90°RL, 1=180°, 2=270°RL (即 90°逆时针)
-            # 我们需要：90° -> type=0 (clockwise/right), 180° -> type=1, 270° -> type=2 (counter-clockwise/left)
-            ttype_map = {90: 0, 180: 1, 270: 2}
-            ttype = ttype_map.get(deg, -1)
-            if ttype >= 0:
-                try:
-                    media.add_option(f":video-filter=transform{{type={ttype}}}")
-                except Exception as e:
-                    print(f"[VideoPlayerWindow] add_option 旋转滤镜失败: {e}")
+        ttype_map = {90: 0, 180: 1, 270: 2}
+        ttype = ttype_map.get(deg, -1)
+        if ttype >= 0:
+            try:
+                media.add_option(f":video-filter=transform{{type={ttype}}}")
+                print(f"[VideoPlayerWindow] VLC 创建媒体（旋转 {deg}°）")
+            except Exception as e:
+                print(f"[VideoPlayerWindow] add_option 旋转滤镜失败: {e}")
         return media
 
     def _on_vlc_tick(self):
-        """每 250ms 更新 VLC 进度条；检测播放错误并降级 OpenCV"""
+        """每 250ms 更新 VLC 进度条"""
         if self._vlc_player is None or self._closed:
             return
         try:
             state = self._vlc_player.get_state()
-            # VLC 状态：0=NothingSpecial, 1=Opening, 2=Buffering, 3=Playing, 4=Paused, 5=Stopped, 6=Ended, 7=Error
-            if state == 7:  # Error — 降级到 OpenCV
-                if self._closed:
-                    return
-                print("[VideoPlayerWindow] VLC 播放错误，降级到 OpenCV")
+            if state == 7:  # Error
                 self._vlc_timer.stop()
-                try:
-                    self._vlc_player.stop()
-                except Exception:
-                    pass
                 self._backend = 'opencv'
                 abs_path = self.video_paths[self.current_index][0] if 0 <= self.current_index < len(self.video_paths) else None
-                if abs_path:
+                if abs_path and not self._closed:
                     self._load_cv(os.path.abspath(abs_path))
                 return
-
             if state in (3, 4):  # Playing or Paused
-                if self._closed:
-                    return
                 total = self._vlc_player.get_length()
                 cur = self._vlc_player.get_time()
                 self._total_ms = max(1, total)
@@ -403,7 +312,7 @@ class VideoPlayerWindow(QMainWindow):
                         self.progress_slider.setRange(0, max(1, total))
                     except Exception:
                         pass
-                    if not self._slider_seeking:  # 用户操作时不被定时器覆盖
+                    if not self._slider_seeking:
                         try:
                             self.progress_slider.setValue(max(0, int(cur)))
                         except Exception:
@@ -431,7 +340,6 @@ class VideoPlayerWindow(QMainWindow):
                 self._rotation = 0
 
         self._current_ms = 0
-        # 进度条先用合理范围，视频加载后由 _on_vlc_tick 更新为真实时长
         self.progress_slider.setRange(0, 1)
         self.progress_slider.setValue(0)
         self.time_current.setText("00:00")
@@ -444,7 +352,7 @@ class VideoPlayerWindow(QMainWindow):
             self._load_cv(abs_path)
 
     def _load_vlc(self, abs_path):
-        """VLC 加载：关键时序——原生窗口 → 绑定 HWND → 创建媒体(含滤镜) → set_media → play()"""
+        """VLC 渲染：创建带旋转滤镜的 Media → set_media → set_hwnd → play"""
         if self._closed:
             return
         try:
@@ -452,37 +360,39 @@ class VideoPlayerWindow(QMainWindow):
                 self._load_cv(abs_path)
                 return
 
-            # 1. 切换到 VLC widget 并触发原生窗口创建
-            if self._vlc_widget:
-                try:
-                    self._video_stack.setCurrentWidget(self._vlc_widget)
-                except Exception:
-                    pass
-                self._vlc_widget.show()
-                self._vlc_widget.winId()   # 强制创建原生句柄
-
-            # 2. 先绑定窗口（play() 之前必须完成）
-            self._bind_vlc_window()
-
-            # 3. 停止旧媒体
+            self._vlc_timer.stop()
             try:
                 self._vlc_player.stop()
             except Exception:
                 pass
 
-            # 4. 创建新媒体（含旋转滤镜，必须在 set_media 前完成）
+            # 1) 切换到 VLC widget，强制创建原生窗口
+            if self._vlc_widget:
+                try:
+                    self._video_stack.setCurrentWidget(self._vlc_widget)
+                except Exception:
+                    pass
+                self._vlc_widget.winId()
+                self._vlc_widget.show()
+
+            # 2) 创建带旋转滤镜的 Media，set_media
             media = self._vlc_build_media(abs_path, self._rotation)
             if media is None:
                 raise RuntimeError("VLC 无法创建媒体")
-
             self._vlc_player.set_media(media)
 
-            # 5. 播放
+            # 3) 绑定窗口句柄
+            try:
+                self._vlc_player.set_hwnd(int(self._vlc_widget.winId()))
+            except Exception as e:
+                print(f"[VideoPlayerWindow] set_hwnd 失败: {e}")
+
+            # 4) 播放
             ret = self._vlc_player.play()
-            print(f"[VideoPlayerWindow] VLC play() = {ret}")
+            print(f"[VideoPlayerWindow] VLC play() = {ret} (rotation={self._rotation}°)")
             self._is_playing = True
             self.btn_play.setText("暂停")
-            # 应用音量（VLC 需要在 play() 之后设置音量才生效）
+            self._vlc_timer.start(250)
             QTimer.singleShot(150, self._apply_volume)
 
         except Exception as e:
@@ -491,12 +401,10 @@ class VideoPlayerWindow(QMainWindow):
             self._load_cv(abs_path)
 
     def _load_cv(self, abs_path):
-        """OpenCV 逐帧播放（VLC 不可用时的回退）"""
+        """OpenCV 逐帧播放（VLC 不可用时）"""
         if self._closed:
             return
         try:
-            if self._vlc_timer:
-                self._vlc_timer.stop()
             if self._cv_timer:
                 self._cv_timer.stop()
             if self._cv_cap:
@@ -506,10 +414,7 @@ class VideoPlayerWindow(QMainWindow):
                     pass
                 self._cv_cap = None
 
-            try:
-                self._video_stack.setCurrentWidget(self._display_label)
-            except Exception:
-                pass
+            self._video_stack.setCurrentWidget(self._display_label)
             self._display_label.clear()
             self._display_label.setText("加载中...")
 
@@ -599,8 +504,8 @@ class VideoPlayerWindow(QMainWindow):
             print(f"[VideoPlayerWindow] cv tick 异常: {e}")
 
     def _show_cv_frame(self, frame):
+        """OpenCV 帧 → 旋转 → 缩放 → QLabel"""
         try:
-            # 确保容器尺寸有效（窗口刚创建时可能为 0）
             cw = self._video_container.width()
             ch = self._video_container.height()
             lw = max(1, cw if cw > 0 else 960)
@@ -610,8 +515,6 @@ class VideoPlayerWindow(QMainWindow):
             scale = min(lw / fw, lh / fh)
             nw = max(1, int(fw * scale))
             nh = max(1, int(fh * scale))
-
-            # 放大也处理（小视频铺满窗口）
             if nw != fw or nh != fh:
                 frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
@@ -624,32 +527,43 @@ class VideoPlayerWindow(QMainWindow):
                 frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w = rgb.shape[:2]
-            # 深拷贝避免 QImage 引用已释放的 numpy 数组数据
-            qimg = QImage(rgb.copy(), w, h, w * 3, QImage.Format_RGB888)
+            h_, w_ = rgb.shape[:2]
+            qimg = QImage(rgb.copy(), w_, h_, w_ * 3, QImage.Format_RGB888)
             if qimg.isNull():
                 return
             self._display_label.setPixmap(QPixmap.fromImage(qimg))
         except Exception as e:
             print(f"[VideoPlayerWindow] _show_cv_frame 异常: {e}")
 
+    def _refresh_cv_frame(self):
+        """强制刷新 OpenCV 当前帧（读取并重新显示当前帧，带当前 rotation）"""
+        if self._cv_cap is None:
+            return
+        try:
+            cur_ms = self._current_ms
+            if cur_ms > 0:
+                self._cv_cap.set(cv2.CAP_PROP_POS_MSEC, cur_ms)
+            ret, frame = self._cv_cap.read()
+            if ret and frame is not None and frame.size > 0:
+                self._show_cv_frame(frame)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------
     # 控制
     # ------------------------------------------------------------
     def toggle_play(self):
-        if self._backend == 'vlc':
-            if self._vlc_player is None:
-                return
+        if self._backend == 'vlc' and self._vlc_player:
             state = self._vlc_player.get_state()
-            # VLC 状态：0=NothingSpecial, 1=Opening, 2=Buffering, 3=Playing, 4=Paused, 5=Stopped, 6=Ended, 7=Error
             if state == 3:  # Playing
                 self._vlc_player.pause()
                 self._is_playing = False
                 self.btn_play.setText("播放")
             else:
-                if state in (5, 6, 7):  # Stopped/Ended/Error → 重新播放
+                if state in (5, 6, 7):  # Stopped/Ended/Error
                     self._vlc_player.play()
                 else:
+                    # Paused(4) 或其它状态 -> 切换为播放
                     self._vlc_player.pause()
                 self._is_playing = True
                 self.btn_play.setText("暂停")
@@ -677,6 +591,7 @@ class VideoPlayerWindow(QMainWindow):
         self.load_video((self.current_index + 1) % len(self.video_paths))
 
     def rotate_video(self, delta_deg):
+        """旋转：更新角度并持久化，然后重建 Media 并 seek 到当前进度"""
         self._rotation = (int(self._rotation) + int(delta_deg)) % 360
         if self.cache_manager and 0 <= self.current_index < len(self.video_paths):
             _, rel_path = self.video_paths[self.current_index]
@@ -687,6 +602,33 @@ class VideoPlayerWindow(QMainWindow):
                     self.cache_manager.rotate_right(rel_path)
             except Exception:
                 pass
+
+        if self._backend == 'vlc':
+            # VLC：重建 Media + seek 回到当前进度
+            self._reload_current()
+        elif self._backend == 'opencv' and self._cv_cap is not None:
+            # OpenCV：_show_cv_frame 每次都读取 self._rotation，强制刷新当前帧
+            self._refresh_cv_frame()
+
+    def _reload_current(self):
+        """重建当前 Media（保持播放进度和播放状态）——用于旋转角度改变"""
+        if self._closed or not (0 <= self.current_index < len(self.video_paths)):
+            return
+        was_playing = self._is_playing
+        cur_ms = max(0, int(self._current_ms))
+        abs_path = os.path.abspath(self.video_paths[self.current_index][0])
+
+        if self._backend == 'vlc':
+            self._load_vlc(abs_path)
+            if cur_ms > 0:
+                QTimer.singleShot(400, lambda: self._seek_to(cur_ms))
+        else:
+            self._load_cv(abs_path)
+            if cur_ms > 0:
+                QTimer.singleShot(200, lambda: self._seek_to(cur_ms))
+
+        if was_playing:
+            self._is_playing = True
 
     def toggle_favorite(self):
         if not self.cache_manager or not (0 <= self.current_index < len(self.video_paths)):
@@ -718,6 +660,76 @@ class VideoPlayerWindow(QMainWindow):
                 "border-radius:5px;font-size:13px;padding:4px 10px;font-weight:bold;}"
                 "QPushButton:hover{background-color:#5a5a7a;}"
             )
+
+    def _seek_to(self, target_ms):
+        """统一跳转入口"""
+        target_ms = max(0, int(target_ms))
+        if self._backend == 'vlc' and self._vlc_player:
+            try:
+                self._vlc_player.set_time(target_ms)
+            except Exception:
+                pass
+        elif self._cv_cap is not None:
+            try:
+                self._cv_cap.set(cv2.CAP_PROP_POS_MSEC, float(target_ms))
+            except Exception:
+                pass
+        try:
+            self._current_ms = target_ms
+            self.time_current.setText(self._format_ms(target_ms))
+        except Exception:
+            pass
+
+    def _apply_volume(self):
+        """应用音量到 VLC 并持久化到 app_config.json"""
+        vol = 0 if self._muted else max(0, min(100, int(self._volume)))
+        try:
+            self.volume_slider.blockSignals(True)
+            self.volume_slider.setValue(vol if not self._muted else 0)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.volume_slider.blockSignals(False)
+            except Exception:
+                pass
+        try:
+            self.volume_label.setText(str(vol))
+        except Exception:
+            pass
+        if self._backend == 'vlc' and self._vlc_player is not None:
+            try:
+                self._vlc_player.audio_set_volume(vol)
+            except Exception:
+                pass
+        from core import save_volume
+        save_volume(self._volume if not self._muted else self._volume)
+
+    def _on_volume_changed(self, value):
+        self._volume = max(0, min(100, int(value)))
+        self._muted = False
+        try:
+            self.btn_mute.setText("🔊")
+        except Exception:
+            pass
+        self._apply_volume()
+
+    def _change_volume(self, delta):
+        self._muted = False
+        self._volume = max(0, min(100, int(self._volume) + int(delta)))
+        try:
+            self.btn_mute.setText("🔊")
+        except Exception:
+            pass
+        self._apply_volume()
+
+    def _toggle_mute(self):
+        self._muted = not self._muted
+        try:
+            self.btn_mute.setText("🔇" if self._muted else "🔊")
+        except Exception:
+            pass
+        self._apply_volume()
 
     def _on_slider_pressed(self):
         self._slider_seeking = True
@@ -788,12 +800,10 @@ class VideoPlayerWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._closed = True
-        # 先停定时器（阻止所有后续 tick）
         if self._vlc_timer:
             self._vlc_timer.stop()
         if self._cv_timer:
             self._cv_timer.stop()
-        # 再停止播放
         if self._vlc_player:
             try:
                 self._vlc_player.stop()

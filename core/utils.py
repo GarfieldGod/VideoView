@@ -12,33 +12,43 @@ from PyQt5.QtGui import QImage, QPixmap
 # ============================================================
 # VLC 依赖检测 —— 优先使用项目内嵌的 vlc/ 目录
 # ============================================================
-# 优先级：1. 项目根目录 vlc/  2. PotPlayer  3. 系统 VLC  4. PATH
+# 优先级：1. 项目根目录 vlc/  2. 系统标准安装路径  3. PATH
+# 注：已移除 PotPlayer / C:\Application\VLC 等 32-bit 或无效路径，避免位数不匹配
 _VLC_CANDIDATES = [
     # 1. 项目内嵌（用户自行复制 VLC 便携版到这里）
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'vlc'),
 ]
-# 2. 系统 VLC
+# 2. 系统标准 VLC 安装路径（64-bit）
 for _p in [
-    r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
-    r"C:\Program Files\PotPlayer\PotPlayerMini64.exe",
-    r"C:\Program Files (x86)\DAUM\PotPlayer\PotPlayerMini.exe",
-    r"C:\Program Files (x86)\PotPlayer\PotPlayerMini.exe",
     r"C:\Program Files\VideoLAN\VLC",
     r"C:\Program Files (x86)\VideoLAN\VLC",
-    r"C:\Application\VLC",
-    r"D:\VLC",
 ]:
-    _VLC_CANDIDATES.append(os.path.dirname(_p))
+    _VLC_CANDIDATES.append(_p)
 # 3. PATH 环境变量
 for _p in os.environ.get("PATH", "").split(os.pathsep):
-    if _p not in _VLC_CANDIDATES:
+    if _p and _p not in _VLC_CANDIDATES:
         _VLC_CANDIDATES.append(_p)
+
+
+def _check_vlc_dll(dll_path):
+    """校验 libvlc.dll 是否可用（基础函数存在则认为是有效 VLC 库）"""
+    try:
+        import ctypes
+        dll = ctypes.CDLL(dll_path)
+        if not hasattr(dll, 'libvlc_media_player_stop'):
+            # 某些 stub / 4.x 版本缺失基础函数
+            return False
+        return True
+    except Exception:
+        return False
+
 
 _VLC_DIR = None
 for _p in _VLC_CANDIDATES:
-    if os.path.isfile(os.path.join(_p, "libvlc.dll")):
-        _VLC_DIR = _p
-        break
+    if _p and os.path.isfile(os.path.join(_p, "libvlc.dll")):
+        if _check_vlc_dll(os.path.join(_p, "libvlc.dll")):
+            _VLC_DIR = _p
+            break
 
 # Python 3.8+：ctypes.LoadLibrary 依赖 add_dll_directory 才能找到 DLL
 if _VLC_DIR and hasattr(os, "add_dll_directory"):
@@ -65,7 +75,7 @@ if _VLC_DIR:
 # 尝试 import python-vlc
 try:
     import vlc as _vlc_module
-    _test_inst = _vlc_module.Instance("--no-xlib --quiet --no-video-title-show --no-osd")
+    _test_inst = _vlc_module.Instance("--no-xlib --quiet --no-video-title-show --no-osd -q")
     if _test_inst is not None:
         _test_player = _test_inst.media_player_new()
         if _test_player is not None:
