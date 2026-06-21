@@ -142,15 +142,15 @@ class VideoPlayerWindow(QMainWindow):
 
         # 底部控制栏
         ctrl = QWidget()
-        ctrl.setFixedHeight(110)
+        ctrl.setFixedHeight(160)
         ctrl.setStyleSheet("background-color:#1a1a2e;")
         ctrl_layout = QVBoxLayout(ctrl)
-        ctrl_layout.setContentsMargins(16, 8, 16, 8)
-        ctrl_layout.setSpacing(4)
+        ctrl_layout.setContentsMargins(20, 10, 20, 10)
+        ctrl_layout.setSpacing(8)
 
         time_row = QHBoxLayout()
         self.time_current = QLabel("00:00")
-        self.time_current.setStyleSheet("color:#bbb; font-size:13px;")
+        self.time_current.setStyleSheet("color:#bbb; font-size:26px;")
         self.progress_slider = QSlider(Qt.Horizontal)
         self.progress_slider.setRange(0, 1)
         self.progress_slider.setValue(0)
@@ -159,79 +159,109 @@ class VideoPlayerWindow(QMainWindow):
         self.progress_slider.sliderMoved.connect(self._on_slider_moved)
         self.progress_slider.installEventFilter(self)
         self.time_total = QLabel("00:00")
-        self.time_total.setStyleSheet("color:#bbb; font-size:13px;")
+        self.time_total.setStyleSheet("color:#bbb; font-size:26px;")
         time_row.addWidget(self.time_current)
         time_row.addWidget(self.progress_slider, 1)
         time_row.addWidget(self.time_total)
 
+        # 按钮行：从左到右 —— [文件名] [左旋/右旋] [上一个/暂停/下一个（中心）] [收藏] [音量]
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-        self.btn_prev = self._make_btn("上一个")
-        self.btn_prev.clicked.connect(self.play_previous)
-        self.btn_play = self._make_btn("暂停")
-        self.btn_play.clicked.connect(self.toggle_play)
-        self.btn_next = self._make_btn("下一个")
-        self.btn_next.clicked.connect(self.play_next)
-        self.btn_rot_left = self._make_btn("左旋 90°")
-        self.btn_rot_left.clicked.connect(lambda: self.rotate_video(-90))
-        self.btn_rot_right = self._make_btn("右旋 90°")
-        self.btn_rot_right.clicked.connect(lambda: self.rotate_video(90))
-        self.btn_fav = self._make_btn("收藏")
-        self.btn_fav.clicked.connect(self.toggle_favorite)
+        btn_row.setSpacing(10)
 
-        # 音量控制
-        self.btn_vol_down = self._make_btn("🔉")
-        self.btn_vol_down.setFixedWidth(38)
-        self.btn_vol_down.clicked.connect(lambda: self._change_volume(-10))
-        self.btn_mute = self._make_btn("🔊")
-        self.btn_mute.setFixedWidth(38)
-        self.btn_mute.clicked.connect(self._toggle_mute)
-        self.btn_vol_up = self._make_btn("🔊+")
-        self.btn_vol_up.setFixedWidth(38)
-        self.btn_vol_up.clicked.connect(lambda: self._change_volume(10))
-        self.volume_slider = QSlider(Qt.Horizontal)
-        self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(self._volume)
-        self.volume_slider.setFixedWidth(100)
-        self.volume_slider.setStyleSheet(
-            "QSlider::groove:horizontal{background:#2a2a3e;height:6px;border-radius:3px;}"
-            "QSlider::handle:horizontal{background:#7a7a9e;width:14px;margin:-5px 0;border-radius:7px;}"
-            "QSlider::handle:horizontal:hover{background:#aaaac0;}"
-        )
-        self.volume_slider.valueChanged.connect(self._on_volume_changed)
-        self.volume_label = QLabel(str(self._volume))
-        self.volume_label.setStyleSheet("color:#bbb;font-size:13px;min-width:28px;")
-
+        # 最左边：视频文件名
         self.filename_label = QLabel("")
-        self.filename_label.setStyleSheet("color:#ddd; font-size:13px; padding:0 8px;")
-        self.filename_label.setAlignment(Qt.AlignCenter)
+        self.filename_label.setStyleSheet("color:#ddd; font-size:45px; font-weight:bold;")
+        self.filename_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.filename_label.setMinimumWidth(400)
+        self.filename_label.setMaximumWidth(560)
+        btn_row.addWidget(self.filename_label)
+
+        # 左侧弹性空间：把中间的播放控制推向中心
+        btn_row.addStretch(1)
+
+        # 中间偏左：旋转按钮
+        self.btn_rot_left = self._make_ctrl_btn("↺ 左旋")
+        self.btn_rot_left.clicked.connect(lambda: self.rotate_video(-90))
+        self.btn_rot_right = self._make_ctrl_btn("↻ 右旋")
+        self.btn_rot_right.clicked.connect(lambda: self.rotate_video(90))
+        btn_row.addWidget(self.btn_rot_left)
+        btn_row.addWidget(self.btn_rot_right)
+
+        # 旋转与播放控制之间留空隙
+        btn_row.addSpacing(40)
+
+        # 正中央：上一个 / 暂停 / 下一个
+        self.btn_prev = self._make_ctrl_btn("上一个")
+        self.btn_prev.clicked.connect(self.play_previous)
+        self.btn_play = self._make_ctrl_btn("暂停")
+        self.btn_play.clicked.connect(self.toggle_play)
+        self.btn_next = self._make_ctrl_btn("下一个")
+        self.btn_next.clicked.connect(self.play_next)
         btn_row.addWidget(self.btn_prev)
         btn_row.addWidget(self.btn_play)
         btn_row.addWidget(self.btn_next)
-        btn_row.addWidget(self.btn_rot_left)
-        btn_row.addWidget(self.btn_rot_right)
+
+        # 播放控制与收藏之间留空隙
+        btn_row.addSpacing(40)
+
+        # 中间偏右：收藏
+        self.btn_fav = self._make_ctrl_btn("♥ 收藏")
+        self.btn_fav.clicked.connect(self.toggle_favorite)
         btn_row.addWidget(self.btn_fav)
-        btn_row.addWidget(self.btn_vol_down)
+
+        # 右侧弹性空间：把音量推到最右边
+        btn_row.addStretch(1)
+
+        # 最右边：音量控制（顺序：静音 → 减 → 滑条 → 加 → 数字）
+        self.volume_label = QLabel(str(self._volume))
+        self.volume_label.setStyleSheet("color:#bbb; font-size:28px; min-width:60px;")
+        self.volume_label.setAlignment(Qt.AlignCenter)
+        self.btn_mute = self._make_ctrl_btn("🔊", small=True)
+        self.btn_mute.clicked.connect(self._toggle_mute)
+        self.btn_vol_down = self._make_ctrl_btn("🔉", small=True)
+        self.btn_vol_down.clicked.connect(lambda: self._change_volume(-10))
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(self._volume)
+        self.volume_slider.setFixedWidth(140)
+        self.volume_slider.setStyleSheet(
+            "QSlider::groove:horizontal{background:#2a2a3e;height:8px;border-radius:4px;}"
+            "QSlider::handle:horizontal{background:#7a7a9e;width:18px;margin:-6px 0;border-radius:9px;}"
+            "QSlider::handle:horizontal:hover{background:#aaaac0;}"
+        )
+        self.volume_slider.valueChanged.connect(self._on_volume_changed)
+        self.btn_vol_up = self._make_ctrl_btn("🔊", small=True)
+        self.btn_vol_up.clicked.connect(lambda: self._change_volume(10))
         btn_row.addWidget(self.btn_mute)
+        btn_row.addWidget(self.btn_vol_down)
+        btn_row.addWidget(self.volume_slider)
         btn_row.addWidget(self.btn_vol_up)
-        btn_row.addWidget(self.volume_slider, 0)
         btn_row.addWidget(self.volume_label)
-        btn_row.addWidget(self.filename_label, 1)
 
         ctrl_layout.addLayout(time_row)
         ctrl_layout.addLayout(btn_row)
         main_layout.addWidget(ctrl)
 
-    def _make_btn(self, text):
+    def _make_ctrl_btn(self, text, small=False):
+        """生成底部控制栏按钮，默认两倍大小；small=True 用于小图标按钮。"""
         btn = QPushButton(text)
-        btn.setFixedHeight(38)
         btn.setCursor(Qt.PointingHandCursor)
-        btn.setStyleSheet(
-            "QPushButton{background-color:#3a3a5a;color:white;border:none;"
-            "border-radius:5px;font-size:13px;padding:4px 10px;font-weight:bold;}"
-            "QPushButton:hover{background-color:#5a5a7a;}"
-            "QPushButton:pressed{background-color:#2a2a4a;}"
-        )
+        if small:
+            btn.setFixedSize(60, 70)
+            btn.setStyleSheet(
+                "QPushButton{background-color:#3a3a5a;color:white;border:none;"
+                "border-radius:10px;font-size:22px;font-weight:bold;}"
+                "QPushButton:hover{background-color:#5a5a7a;}"
+                "QPushButton:pressed{background-color:#2a2a4a;}"
+            )
+        else:
+            btn.setFixedSize(140, 70)
+            btn.setStyleSheet(
+                "QPushButton{background-color:#3a3a5a;color:white;border:none;"
+                "border-radius:10px;font-size:24px;font-weight:bold;}"
+                "QPushButton:hover{background-color:#5a5a7a;}"
+                "QPushButton:pressed{background-color:#2a2a4a;}"
+            )
         return btn
 
     def eventFilter(self, obj, event):
@@ -684,18 +714,20 @@ class VideoPlayerWindow(QMainWindow):
             _, rel_path = self.video_paths[self.current_index]
             is_fav = self.cache_manager.is_favorite(rel_path)
         if is_fav:
-            self.btn_fav.setText("已收藏")
+            self.btn_fav.setText("♥ 已收藏")
             self.btn_fav.setStyleSheet(
-                "QPushButton{background-color:#c84040;color:white;border:2px solid #e86060;"
-                "border-radius:5px;font-size:13px;padding:4px 10px;font-weight:bold;}"
+                "QPushButton{background-color:#c84040;color:white;border:none;"
+                "border-radius:10px;font-size:24px;font-weight:bold;}"
                 "QPushButton:hover{background-color:#e85050;}"
+                "QPushButton:pressed{background-color:#a03030;}"
             )
         else:
-            self.btn_fav.setText("收藏")
+            self.btn_fav.setText("♥ 收藏")
             self.btn_fav.setStyleSheet(
-                "QPushButton{background-color:#3a3a5a;color:white;border:2px solid #5a5a7a;"
-                "border-radius:5px;font-size:13px;padding:4px 10px;font-weight:bold;}"
+                "QPushButton{background-color:#3a3a5a;color:white;border:none;"
+                "border-radius:10px;font-size:24px;font-weight:bold;}"
                 "QPushButton:hover{background-color:#5a5a7a;}"
+                "QPushButton:pressed{background-color:#2a2a4a;}"
             )
 
     def _seek_to(self, target_ms):
@@ -759,6 +791,7 @@ class VideoPlayerWindow(QMainWindow):
         self._muted = False
         self._volume = max(0, min(100, int(self._volume) + int(delta)))
         try:
+            self.volume_slider.setValue(self._volume)
             self.btn_mute.setText("🔊")
         except Exception:
             pass

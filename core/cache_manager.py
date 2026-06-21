@@ -19,11 +19,37 @@ def path_hash(path):
 
 
 class CacheManager:
-    def __init__(self, cache_dir, root_folder):
+    def __init__(self, cache_dir, root_folder, base_path=None):
+        """创建缓存管理器。
+
+        Args:
+            cache_dir: 缓存目录（如 "D:/Videos/.videoview/cache"）
+            root_folder: 项目根目录（始终为最顶层根目录）
+            base_path: 实际目录（用于 favorites/rotations 路径解析），默认为 root_folder
+
+        路径系统说明：
+          - 调用端传入的都是「根目录相对路径」：如 "A/B/video1.mp4"
+          - 子目录 CacheManager 需要把它转成「子目录内相对路径」：如 "video1.mp4"
+          - 子目录相对前缀由 rel_prefix = "A/B"
+        """
         self.cache_dir = cache_dir
         self.root_folder = root_folder.replace('\\', '/')
+        self.base_path = (base_path or root_folder).replace('\\', '/')
+
+        # 计算子目录 CacheManager 的相对路径前缀（root_folder 级 CacheManager rel_prefix = None）
+        normalized_root = os.path.normpath(self.root_folder)
+        normalized_base = os.path.normpath(self.base_path)
+        if os.path.normpath(normalized_base) == os.path.normpath(normalized_root):
+            self._rel_prefix = None
+        else:
+            rel = os.path.relpath(normalized_base, normalized_root).replace('\\', '/')
+            if rel == '.' or rel == '' or rel.rstrip('/.'):
+                self._rel_prefix = None
+            else:
+                self._rel_prefix = rel
+
         self.manifest_path = os.path.join(cache_dir, 'cache_manifest.json')
-        # favorites.json 放在 .videoview 根目录（与 rotations.json、marked_collections.json 同级）
+        # favorites.json 放在 .videoview 根目录
         self.favorites_path = os.path.join(os.path.dirname(cache_dir), 'favorites.json')
         self.manifest = self._load_manifest()
         self.favorites = self._load_favorites()
@@ -31,8 +57,22 @@ class CacheManager:
         self.rotations = self._load_rotations()
 
     # ------------------------------------------------------------
-    # 缓存清单
+    # 路径归一化（核心逻辑）
     # ------------------------------------------------------------
+
+    def _strip_prefix(self, rel_path):
+        """将「根目录相对路径」转换为「子目录内相对路径」（只对子目录 CacheManager 生效）。
+
+        例如：rel_path = "A/B/video1.mp4", _rel_prefix = "A/B" → 返回 "video1.mp4"
+              rel_path = "video1.mp4", _rel_prefix = None → 返回 "video1.mp4"
+        """
+        normalized = rel_path.replace('\\', '/')
+        if self._rel_prefix is None:
+            return normalized
+        prefix = self._rel_prefix.replace('\\', '/') + '/'
+        if normalized.startswith(prefix):
+            return normalized[len(prefix):]
+        return normalized
 
     def _load_manifest(self):
         if os.path.exists(self.manifest_path):
@@ -73,35 +113,94 @@ class CacheManager:
         except Exception as e:
             print(f"[CacheManager] 保存收藏列表失败: {e}")
 
-    def get_cache_path(self, video_relative_path, rotation_deg=0):
-        normalized = video_relative_path.replace('\\', '/')
+    def get_cache_path(self, video_relative_path, rotation_deg=None):
+        """返回视频的缓存文件路径 — 始终使用 hash.jpg，不区分旋转角度。
+
+        路径先通过 _strip_prefix() 归一化，保证子目录和根目录 CacheManager
+        用同一语义计算缓存 key。
+        """
+        normalized = self._strip_prefix(video_relative_path)
         cache_key = path_hash(normalized)
-        deg = int(rotation_deg) % 360
-        if deg == 0:
-            return os.path.join(self.cache_dir, f"{cache_key}.jpg")
-        return os.path.join(self.cache_dir, f"{cache_key}_rot{deg}.jpg")
+        return os.path.join(self.cache_dir, f"{cache_key}.jpg")
 
-    def cache_exists(self, video_relative_path, rotation_deg=0):
-        cache_path = self.get_cache_path(video_relative_path, rotation_deg)
-        return os.path.exists(cache_path), cache_path
+    def cache_exists(self, video_relative_path, rotation_deg=None):
+        """检查视频是否有缓存（兼容新旧格式）。
 
-    def add_cache(self, video_relative_path, cache_path, rotation_deg=0):
-        deg = int(rotation_deg) % 360
-        cache_key = path_hash(video_relative_path.replace('\\', '/'))
-        manifest_key = video_relative_path.replace('\\', '/')
-        if deg == 0:
-            self.manifest[manifest_key] = cache_key
+        1. 检查新的 hash.jpg 是否存在且可读
+        2. 若不存在但有旧的 hash_rotXXX.jpg，迁移到新的 hash.jpg
+        3. 验证文件可读
+        """
+        normalized = self._strip_prefix(video_relative_path)
+        cache_key = path_hash(normalized)
+        new_path = os.path.join(self.cache_dir, f"{cache_key}.jpg")
+
+        # 优先检查新格式
+        if os.path.exists(new_path):
+            try:
+                with open(new_path, 'rb') as f:
+                    f.read(1)
+                return True, new_path
+            except Exception:
+                try:
+                    os.remove(new_path)
+                except Exception:
+                    pass
         else:
-            self.manifest[manifest_key] = f"{cache_key}_rot{deg}"
+            # 新格式不存在，尝试旧格式 hash_rotXXX.jpg
+            import glob as glob_module
+            old_pattern = os.path.join(self.cache_dir, f"{cache_key}_rot*.jpg")
+            old_files = glob_module.glob(old_pattern)
+            if old_files:
+                old_path = old_files[0]
+                try:
+                    with open(old_path, 'rb') as f:
+                        f.read(1)
+                    os.replace(old_path, new_path)
+                    return True, new_path
+                except Exception:
+                    try:
+                        os.remove(old_path)
+                    except Exception:
+                        pass
+
+        return False, new_path
+
+    def add_cache(self, video_relative_path, cache_path, rotation_deg=None):
+        """将视频记录到缓存清单 — 始终覆盖"""
+        normalized = self._strip_prefix(video_relative_path)
+        cache_key = path_hash(normalized)
+        self.manifest[normalized] = cache_key
         self._save_manifest()
 
+    def clear_cache_for(self, video_relative_path):
+        """删除指定视频的缓存文件（用于旋转后重新生成），同时清理新旧格式"""
+        normalized = self._strip_prefix(video_relative_path)
+        cache_key = path_hash(normalized)
+
+        # 删除新格式
+        new_path = os.path.join(self.cache_dir, f"{cache_key}.jpg")
+        try:
+            if os.path.exists(new_path):
+                os.remove(new_path)
+        except Exception:
+            pass
+
+        # 删除可能残留的旧格式文件
+        import glob as glob_module
+        old_pattern = os.path.join(self.cache_dir, f"{cache_key}_rot*.jpg")
+        for old_path in glob_module.glob(old_pattern):
+            try:
+                os.remove(old_path)
+            except Exception:
+                pass
+
     def is_favorite(self, video_relative_path):
-        normalized = video_relative_path.replace('\\', '/')
+        normalized = self._strip_prefix(video_relative_path)
         fav_list = self.favorites.get('collections', {}).get('默认收藏夹', [])
         return normalized in fav_list
 
     def toggle_favorite(self, video_relative_path):
-        normalized = video_relative_path.replace('\\', '/')
+        normalized = self._strip_prefix(video_relative_path)
         fav_list = self.favorites.get('collections', {}).setdefault('默认收藏夹', [])
         if normalized in fav_list:
             fav_list.remove(normalized)
@@ -116,14 +215,14 @@ class CacheManager:
         fav_list = self.favorites.get('collections', {}).get('默认收藏夹', [])
         result = []
         for rel_path in fav_list:
-            abs_path = os.path.join(self.root_folder, rel_path)
+            abs_path = os.path.join(self.base_path, rel_path)
             if os.path.exists(abs_path):
                 result.append(abs_path)
         return result
 
     def get_favorite_count(self):
         fav_list = self.favorites.get('collections', {}).get('默认收藏夹', [])
-        return len([f for f in fav_list if os.path.exists(os.path.join(self.root_folder, f))])
+        return len([f for f in fav_list if os.path.exists(os.path.join(self.base_path, f))])
 
     # ===== 收藏夹标记功能 =====
     def _load_marked_collections(self):

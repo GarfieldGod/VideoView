@@ -13,10 +13,16 @@ THUMBNAIL_SIZE_VIDEO = (560, int(560 * 16 / 9))         # 视频预览网格
 
 def generate_video_thumbnail_file(video_path, target_width, target_height,
                                    cache_path, rotation_deg=0):
-    """生成视频缩略图并保存到缓存文件 - 仅使用 cv2
+    """生成视频缩略图并保存到缓存文件（旋转后覆盖原有缓存）。
 
-    按 9:16 比例从视频中间裁剪；rotation_deg 不为零时应用旋转。
+    按当前 rotation_deg 应用旋转后裁剪缩放；每次都会先删除旧缓存文件再写入新的。
     """
+    try:
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+    except Exception:
+        pass
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise Exception("无法打开视频")
@@ -38,7 +44,7 @@ def generate_video_thumbnail_file(video_path, target_width, target_height,
     if not ret or frame is None:
         raise Exception("无法读取视频帧")
 
-    # ===== 应用旋转（影响后续宽高比计算）=====
+    # 应用旋转（影响后续宽高比计算）
     deg = int(rotation_deg) % 360
     if deg == 90:
         frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
@@ -52,17 +58,17 @@ def generate_video_thumbnail_file(video_path, target_width, target_height,
     video_height = frame.shape[0]
 
     video_aspect = video_width / video_height
-    target_aspect = 9 / 16
+    target_aspect = target_width / target_height
 
     if abs(video_aspect - target_aspect) < 0.01:
         frame = cv2.resize(frame, (target_width, target_height))
     elif video_aspect > target_aspect:
-        crop_width = int(video_height * 9 / 16)
+        crop_width = int(video_height * target_aspect)
         crop_x = (video_width - crop_width) // 2
         frame = frame[:, crop_x:crop_x + crop_width]
         frame = cv2.resize(frame, (target_width, target_height))
     else:
-        crop_height = int(video_width * 16 / 9)
+        crop_height = int(video_width / target_aspect)
         crop_y = (video_height - crop_height) // 2
         frame = frame[crop_y:crop_y + crop_height, :]
         frame = cv2.resize(frame, (target_width, target_height))

@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtGui import QPixmap, QPainter, QColor
 
-from core.cache_manager import CacheManager
+from core.cache_manager import CacheManager, path_hash
 from core.utils import ThumbnailManager, scan_folder_for_videos
 from core.config import set_last_root_folder, get_last_root_folder
 from core.thumbnail import THUMBNAIL_SIZE_COLLECTION
@@ -131,6 +131,10 @@ class MainWindow(QMainWindow):
             "border-radius:8px;font-size:22px;font-weight:bold;padding:10px 20px;}"
             "QPushButton:hover {background-color:#5a5a7a;}"
             "QPushButton:pressed {background-color:#3a3a5a;}"
+            "QMenu {background-color:#2a2a44; border:1px solid #4a4a6a; border-radius:6px; padding:4px;}"
+            "QMenu::item {color:white; padding:8px 24px; border-radius:4px;}"
+            "QMenu::item:selected {background-color:#4a4a6a; color:#ffcc00;}"
+            "QMenu::separator {height:1px; background:#4a4a6a; margin:4px 8px;}"
         )
         self.left_panel.setStyleSheet(
             "QFrame {background-color:#1a1a2e; border-right:1px solid #2a2a4a;}"
@@ -164,38 +168,115 @@ class MainWindow(QMainWindow):
                 widget.update_from_cache()
 
     def on_video_rotated(self, video_abs_path, video_relative_path):
-        """视频旋转后回调：重新生成对应旋转角度的缩略图并刷新UI"""
+        """视频旋转后回调：删除旧缓存 → 按新角度重新生成缩略图 → 刷新UI"""
         rel_path = video_relative_path.replace('\\', '/')
+        cm = self.cache_manager
 
-        # 触发异步重新生成（含新的旋转角度）
+        # 获取新的旋转角度
         rotation = 0
-        if self.cache_manager:
-            try:
-                rotation = int(self.cache_manager.get_rotation(rel_path)) % 360
-            except Exception:
-                pass
-        if self.thumbnail_manager:
-            self.thumbnail_manager.enqueue(
-                video_abs_path, rel_path, rotation
-            )
+        try:
+            rotation = int(cm.get_rotation(rel_path)) % 360
+        except Exception:
+            pass
 
-        # 同时刷新 UI 中的 item（会按新 rotation 重新查找缓存或触发生成）
+        # 删除旧缓存
+        cm.clear_cache_for(rel_path)
+
+        # 触发异步重新生成（按新角度写入同一缓存路径）
+        if self.thumbnail_manager:
+            self.thumbnail_manager.enqueue(video_abs_path, rel_path, rotation)
+
+        # 刷新 UI 中的 item
         if hasattr(self, 'right_panel'):
             if video_relative_path in self.right_panel.video_items:
                 video_item = self.right_panel.video_items[video_relative_path]
-                # 重置 thumbnail_loaded 标志，使 update_from_cache 可以根据新角度检查缓存
                 if hasattr(video_item, '_thumbnail_loaded'):
                     video_item._thumbnail_loaded = False
                 if hasattr(video_item, 'update_from_cache'):
                     video_item.update_from_cache()
 
-        # 刷新左侧收藏夹中对应视频的缩略图
-        if video_relative_path in self._collection_thumbnail_items:
+        if video_relative_path in getattr(self, '_collection_thumbnail_items', {}):
             widget = self._collection_thumbnail_items[video_relative_path]
             if widget:
                 if hasattr(widget, '_thumbnail_loaded'):
                     widget._thumbnail_loaded = False
                 widget.update_from_cache()
+
+    def on_batch_rotate_collection(self, collection_name, delta_deg):
+        """批量旋转整个收藏夹的视频：更新对应 .videoview 的 rotations.json + 重新生成缩略图"""
+        if not self.cache_manager:
+            return
+
+        # 找到对应 collection 的所有视频
+        target_collection = None
+        for c in self.collections:
+            if c['name'] == collection_name:
+                target_collection = c
+                break
+
+        if target_collection is None or not target_collection['videos']:
+            return
+
+        abs_rel_pairs = []
+        for video_abs in target_collection['videos']:
+            try:
+                rel = os.path.relpath(video_abs, self.root_folder).replace('\\', '/')
+                abs_rel_pairs.append((video_abs, rel))
+            except Exception:
+                continue
+
+        if not abs_rel_pairs:
+            return
+
+        # 1. 更新根目录 .videoview 中 rotations.json 的旋转角度
+        for abs_path, rel in abs_rel_pairs:
+            # cm = self._get_cache_manager_for_rel(rel)  # 映射子目录.videoview的代码已注释
+            cm = self.cache_manager  # 统一使用根目录的 cache_manager
+            if delta_deg < 0:
+                cm.rotate_left(rel)
+            else:
+                cm.rotate_right(rel)
+
+        # 2. 删除各自的缓存文件
+        for abs_path, rel in abs_rel_pairs:
+            # cm = self._get_cache_manager_for_rel(rel)  # 映射子目录.videoview的代码已注释
+            cm = self.cache_manager  # 统一使用根目录的 cache_manager
+            cm.clear_cache_for(rel)
+
+        # 3. 触发重新生成缩略图（异步）
+        if self.thumbnail_manager:
+            for abs_path, rel in abs_rel_pairs:
+                # cm = self._get_cache_manager_for_rel(rel)  # 映射子目录.videoview的代码已注释
+                cm = self.cache_manager  # 统一使用根目录的 cache_manager
+                rotation = 0
+                try:
+                    rotation = int(cm.get_rotation(rel)) % 360
+                except Exception:
+                    pass
+                self.thumbnail_manager.enqueue(abs_path, rel, rotation)
+
+        # 4. 刷新 UI：左侧收藏夹的缩略图 + 右侧视频网格
+        # 刷新左侧收藏夹中该收藏夹的代表视频缩略图
+        if target_collection['videos']:
+            first_rel = os.path.relpath(target_collection['videos'][0], self.root_folder).replace('\\', '/')
+            if first_rel in getattr(self, '_collection_thumbnail_items', {}):
+                widget = self._collection_thumbnail_items[first_rel]
+                if widget:
+                    if hasattr(widget, '_thumbnail_loaded'):
+                        widget._thumbnail_loaded = False
+                    if hasattr(widget, 'update_from_cache'):
+                        widget.update_from_cache()
+
+        # 刷新右侧视频网格：如果当前显示的是这个 collection，刷新其所有 item
+        if hasattr(self, 'right_panel') and hasattr(self.right_panel, 'video_items'):
+            for rel, item in self.right_panel.video_items.items():
+                if item is not None:
+                    if hasattr(item, '_thumbnail_loaded'):
+                        item._thumbnail_loaded = False
+                    if hasattr(item, 'update_from_cache'):
+                        item.update_from_cache()
+
+        print(f"[批量旋转] 收藏夹 '{collection_name}': 旋转了 {len(abs_rel_pairs)} 个视频（{'左旋' if delta_deg < 0 else '右旋'} 90°）")
 
     def on_favorite_changed(self, video_relative_path, new_state):
         if self.cache_manager:
@@ -226,60 +307,65 @@ class MainWindow(QMainWindow):
                 print(f"自动加载上次目录失败: {e}")
 
     def scan_collections(self, folder_path):
+        """递归扫描所有层级的子目录，每个包含直接视频的子目录都作为一个独立的收藏集。
+        例如：D:/Videos/A/B -> 收藏集 "A/B"（只包含 B 的直接视频，不包含更深层子目录的视频）"""
         self.collections.clear()
         self.collection_list.clear()
 
+        # 第一步：用 os.walk 收集所有子目录的相对路径
+        all_subfolders = []
         try:
-            subfolders = sorted(
-                d for d in os.listdir(folder_path)
-                if os.path.isdir(os.path.join(folder_path, d))
-            )
+            for dirpath, dirnames, filenames in os.walk(folder_path):
+                # 跳过 .videoview 配置目录
+                dirnames[:] = [d for d in dirnames if d != '.videoview']
+                rel_path = os.path.relpath(dirpath, folder_path).replace('\\', '/')
+                # 排除根目录本身（rel_path == '.'）和 .videoview
+                if rel_path != '.' and '.videoview' not in rel_path.split('/'):
+                    all_subfolders.append((rel_path, dirpath))
         except Exception as e:
             print(f"扫描文件夹失败: {e}")
             return
 
+        # 按相对路径字母序排序
+        all_subfolders.sort(key=lambda x: x[0])
+
         # 进度对话框
-        progress = QProgressDialog("正在扫描文件夹...", "取消", 0, len(subfolders), self)
+        progress = QProgressDialog("正在扫描文件夹...", "取消", 0, len(all_subfolders), self)
         progress.setWindowTitle("扫描中")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
+        progress.setMaximumWidth(500)  # 限制进度条窗口宽度，避免过长
         progress.setValue(0)
 
-        for i, subfolder in enumerate(subfolders):
+        for i, (rel_path, abs_path) in enumerate(all_subfolders):
             if progress.wasCanceled():
                 break
-            subfolder_path = os.path.join(folder_path, subfolder)
-            videos = scan_folder_for_videos(subfolder_path)
+            # 只收集该目录的直接视频，不包含更深层子目录的视频
+            videos = scan_folder_for_videos(abs_path, recursive=False)
             if videos:
+                # 用相对路径作为 collection name（如 "A/B"），确保唯一性且体现层级
+                name = rel_path
                 self.collections.append({
-                    'name': subfolder,
-                    'path': subfolder_path,
+                    'name': name,
+                    'path': abs_path,
                     'videos': videos,
                 })
             progress.setValue(i + 1)
-            progress.setLabelText(f"扫描: {subfolder}")
+            progress.setLabelText(f"扫描: {rel_path}")
 
         progress.close()
 
         self.populate_collection_list()
         self.populate_fav_collection_list()
 
-        # 不默认选中第一个收藏夹，避免启动时为所有视频生成缩略图造成高负载
-        # 用户点击某个收藏夹时才开始加载该收藏夹的缩略图和视频
-
-    # ------------------------------------------------------------
-    # 填充列表
-    # ------------------------------------------------------------
     def populate_collection_list(self):
         self.collection_list.clear()
         self._collection_thumbnail_items.clear()
 
-        # 按标记状态排序：未标记在前
+        # 按标记状态排序：统一使用根目录 cache_manager
         if self.cache_manager:
-            unmarked = [c for c in self.collections
-                        if not self.cache_manager.is_marked(c['name'])]
-            marked = [c for c in self.collections
-                      if self.cache_manager.is_marked(c['name'])]
+            unmarked = [c for c in self.collections if not self.cache_manager.is_marked(c['name'])]
+            marked = [c for c in self.collections if self.cache_manager.is_marked(c['name'])]
             ordered = unmarked + marked
         else:
             ordered = self.collections
@@ -324,6 +410,7 @@ class MainWindow(QMainWindow):
                 cache_manager=self.cache_manager,
                 video_relative_path=video_rel,
                 on_thumbnail_ready=thumb_callback,
+                on_batch_rotate=self.on_batch_rotate_collection,
             )
             self.collection_list.setItemWidget(item, widget)
 
@@ -419,15 +506,7 @@ class MainWindow(QMainWindow):
         self.current_tab = mode
         self._update_switch_buttons(mode)
         self.list_stack.setCurrentIndex(mode)
-
-        if mode == 0 and self.collections:
-            if self.collection_list.count() > 0:
-                self.collection_list.setCurrentRow(0)
-                self.on_collection_clicked(self.collection_list.item(0))
-        elif mode == 1:
-            if self.fav_collection_list.count() > 0:
-                self.fav_collection_list.setCurrentRow(0)
-                self.on_fav_collection_clicked(self.fav_collection_list.item(0))
+        # 不自动选中第一个收藏夹，避免为所有视频触发缩略图加载
 
     def on_collection_clicked(self, item):
         self.current_tab = 0
@@ -463,7 +542,7 @@ class MainWindow(QMainWindow):
             ).replace('\\', '/')
             self.current_video_list.append((video_path, video_relative_path))
             self.right_panel.add_video(
-                video_path, video_relative_path, self.cache_manager
+                video_path, video_relative_path, self.cache_manager,
             )
 
     def show_default_favorites(self):
@@ -486,7 +565,7 @@ class MainWindow(QMainWindow):
             ).replace('\\', '/')
             self.current_video_list.append((video_path, video_relative_path))
             self.right_panel.add_video(
-                video_path, video_relative_path, self.cache_manager
+                video_path, video_relative_path, self.cache_manager,
             )
 
     # ------------------------------------------------------------

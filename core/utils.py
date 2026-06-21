@@ -128,13 +128,12 @@ class ThumbnailManager(QThread):
         self.pending = set()
 
     def enqueue(self, video_path, video_relative_path, rotation_deg=0):
-        deg = int(rotation_deg) % 360
-        # 使用 (相对路径, 旋转角度) 作为去重 key，确保同视频不同旋转都会被处理
-        dedup_key = (video_relative_path.replace('\\', '/'), deg)
+        """入队生成缩略图 — 视频路径为去重 key，rotation_deg 仅用于生成时的旋转参数"""
+        dedup_key = video_relative_path.replace('\\', '/')
         with self.lock:
             if dedup_key not in self.pending:
                 self.pending.add(dedup_key)
-                self.queue.put((video_path, video_relative_path, deg))
+                self.queue.put((video_path, video_relative_path, rotation_deg))
 
     def process_pending(self):
         while self.running:
@@ -147,11 +146,11 @@ class ThumbnailManager(QThread):
             try:
                 target_width = 560
                 target_height = int(target_width * 16 / 9)
-                # 使用旋转角度生成不同的缓存文件
-                cache_path = self.cache_manager.get_cache_path(video_relative_path, deg)
+                # 获取缓存路径（统一 hash.jpg，不区分角度；旋转后需先调用 clear_cache_for）
+                cache_path = self.cache_manager.get_cache_path(video_relative_path)
 
                 if not os.path.exists(cache_path):
-                    # 延迟导入避免循环依赖
+                    # 生成（函数内部会先删除旧文件再写入新的）
                     from core.thumbnail import generate_video_thumbnail_file
                     generate_video_thumbnail_file(video_path, target_width, target_height, cache_path, deg)
                     self.cache_manager.add_cache(video_relative_path, cache_path, deg)
@@ -162,7 +161,7 @@ class ThumbnailManager(QThread):
             finally:
                 with self.lock:
                     self.active_count -= 1
-                    pending_key = (video_relative_path.replace('\\', '/'), int(deg))
+                    pending_key = video_relative_path.replace('\\', '/')
                     self.pending.discard(pending_key)
 
     def run(self):
@@ -188,12 +187,25 @@ def is_video_file(filename):
     return ext in VIDEO_EXTENSIONS
 
 
-def scan_folder_for_videos(folder_path):
+def scan_folder_for_videos(folder_path, recursive=False):
+    """扫描文件夹下的视频文件
+
+    Args:
+        folder_path: 要扫描的文件夹路径
+        recursive: 是否递归扫描子文件夹（默认 False，只扫描直接文件）
+    """
     videos = []
-    for root, dirs, files in os.walk(folder_path):
-        for file in files:
-            if is_video_file(file):
-                videos.append(os.path.join(root, file))
+    if recursive:
+        for root, dirs, files in os.walk(folder_path):
+            for file in files:
+                if is_video_file(file):
+                    videos.append(os.path.join(root, file))
+    else:
+        # 只扫描直接文件，不递归进入子目录
+        for file in os.listdir(folder_path):
+            file_path = os.path.join(folder_path, file)
+            if os.path.isfile(file_path) and is_video_file(file):
+                videos.append(file_path)
     return videos
 
 

@@ -14,6 +14,16 @@ from PyQt5.QtCore import QUrl
 from core.thumbnail import THUMBNAIL_SIZE_COLLECTION, THUMBNAIL_SIZE_VIDEO
 
 
+# 右键菜单统一样式：文字白色，悬浮黄色
+MENU_QSS = (
+    "QMenu {background-color:#2a2a44; border:1px solid #4a4a6a;"
+    "border-radius:6px; padding:4px;}"
+    "QMenu::item {color:white; padding:8px 24px; border-radius:4px;}"
+    "QMenu::item:selected {background-color:#4a4a6a; color:#ffcc00;}"
+    "QMenu::separator {height:1px; background:#4a4a6a; margin:4px 8px;}"
+)
+
+
 # ============================================================
 # FlowLayout：流式自动换行布局
 # ============================================================
@@ -105,7 +115,8 @@ class CollectionItem(QWidget):
     def __init__(self, name, thumbnail_path, video_count,
                  is_marked=False, parent=None, on_mark_changed=None,
                  cache_manager=None, video_relative_path=None,
-                 on_thumbnail_ready=None):
+                 on_thumbnail_ready=None, on_batch_rotate=None,
+                 cache_manager_resolver=None):
         super().__init__(parent)
         self.name = name
         self.thumbnail_path = thumbnail_path
@@ -115,33 +126,45 @@ class CollectionItem(QWidget):
         self.cache_manager = cache_manager
         self.video_relative_path = video_relative_path
         self.on_thumbnail_ready = on_thumbnail_ready
+        self.on_batch_rotate = on_batch_rotate
+        # 缓存管理器解析器：返回给定 rel_path 应使用的 CacheManager（支持子目录独立配置）
+        self.cache_manager_resolver = cache_manager_resolver
         self._thumbnail_loaded = False
         self.setup_ui()
         # 不在初始化时加载缩略图：避免一次性为所有文件夹生成缩略图造成高负载
         # 仅在用户点击时调用 load_thumbnail() 才开始加载
 
     def load_thumbnail(self):
-        """加载缩略图：优先从缓存加载，否则触发异步生成（只执行一次）"""
+        """加载缩略图：优先从缓存加载；否则触发异步生成（按当前旋转角度生成到同一缓存路径）"""
         if self._thumbnail_loaded:
             return
         self._thumbnail_loaded = True
-        if not self.cache_manager or not self.video_relative_path:
+        cm = self._resolve_cache_manager()
+        if not cm or not self.video_relative_path:
             return
 
-        rotation = 0
-        try:
-            rotation = int(self.cache_manager.get_rotation(self.video_relative_path)) % 360
-        except Exception:
-            pass
-
-        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path, rotation)
+        # 统一从 hash.jpg 读取
+        exists, cache_path = cm.cache_exists(self.video_relative_path)
         if exists:
             self._set_thumbnail(cache_path)
             return
 
-        # 触发异步生成（ThumbnailManager 会在生成完成后通过 update_from_cache 刷新）
+        # 获取当前旋转角度用于生成新缩略图
+        rotation = 0
+        try:
+            rotation = int(cm.get_rotation(self.video_relative_path)) % 360
+        except Exception:
+            pass
+
+        # 触发异步生成（按当前旋转角度生成到 hash.jpg）
         if self.on_thumbnail_ready:
             self.on_thumbnail_ready(self.video_relative_path, rotation)
+
+    def _resolve_cache_manager(self):
+        """获取正确的 CacheManager（支持子目录独立配置）"""
+        if self.cache_manager_resolver:
+            return self.cache_manager_resolver(self.video_relative_path)
+        return self.cache_manager
 
     def release_thumbnail(self):
         """释放缩略图（滑出视口时调用，节省内存）"""
@@ -159,29 +182,28 @@ class CollectionItem(QWidget):
         return self._thumbnail_loaded
 
     def update_from_cache(self):
-        """从缓存刷新缩略图（ThumbnailManager 生成完成后调用，或旋转角度改变时调用）"""
-        # 若已加载过则更新；未加载过则现在加载（支持外部强制刷新）
-        if not self.cache_manager or not self.video_relative_path:
+        """从缓存刷新缩略图（缩略图生成完成后调用，或旋转后调用）"""
+        cm = self._resolve_cache_manager()
+        if not cm or not self.video_relative_path:
             return
 
-        rotation = 0
-        try:
-            rotation = int(self.cache_manager.get_rotation(self.video_relative_path)) % 360
-        except Exception:
-            pass
-
-        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path, rotation)
+        exists, cache_path = cm.cache_exists(self.video_relative_path)
         if exists:
             self._thumbnail_loaded = True
             self._set_thumbnail(cache_path)
         else:
-            # 没有对应旋转角度的缓存 — 释放当前缩略图并触发异步生成
+            # 没有缓存 — 释放当前缩略图并触发异步生成
             try:
                 self.thumbnail_label.clear()
                 self.thumbnail_label.setText("📁")
             except Exception:
                 pass
             self._thumbnail_loaded = False
+            rotation = 0
+            try:
+                rotation = int(cm.get_rotation(self.video_relative_path)) % 360
+            except Exception:
+                pass
             if self.on_thumbnail_ready:
                 self.on_thumbnail_ready(self.video_relative_path, rotation)
                 self._thumbnail_loaded = True
@@ -253,25 +275,29 @@ class CollectionItem(QWidget):
         layout.addWidget(self.name_label, alignment=Qt.AlignCenter)
         layout.addWidget(self.count_label, alignment=Qt.AlignCenter)
 
+        # 右键菜单支持（批量旋转整个收藏夹的视频）
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu)
+
     def _update_mark_button_style(self):
         if self.is_marked:
             self.mark_btn.setStyleSheet(
                 "QPushButton {background-color: rgba(60, 160, 90, 0.92); "
                 "border: 2px solid rgba(90, 200, 120, 0.9); border-radius: 20px; "
                 "color: white; font-size: 22px;}"
+                "padding: 0px;"
                 "QPushButton:hover {background-color: rgba(80, 180, 110, 0.95);}"
             )
-            self.mark_btn.setText("✓")
         else:
             self.mark_btn.setStyleSheet(
                 "QPushButton {background-color: rgba(40, 40, 60, 0.6); "
                 "border: 2px solid rgba(100, 100, 120, 0.5); border-radius: 20px; "
                 "color: rgba(160, 160, 180, 0.55); font-size: 22px;}"
+                "padding: 0px;"
                 "QPushButton:hover {background-color: rgba(60, 60, 80, 0.75); "
                 "border: 2px solid rgba(150, 150, 170, 0.7); "
                 "color: rgba(200, 200, 220, 0.85);}"
             )
-            self.mark_btn.setText("○")
 
     def _on_mark_clicked(self):
         self.is_marked = not self.is_marked
@@ -279,6 +305,24 @@ class CollectionItem(QWidget):
         if self.on_mark_changed:
             self.on_mark_changed(self.name, self.is_marked)
 
+    def _on_context_menu(self, pos):
+        """右键菜单：批量旋转整个收藏夹的视频（左旋90°/右旋90°）"""
+        try:
+            if not self.on_batch_rotate:
+                return
+            menu = QMenu(self)
+            menu.setStyleSheet(MENU_QSS)
+            action_left = QAction(f"↺ 左旋 90°（{self.video_count} 个视频）", self)
+            action_left.triggered.connect(lambda: self.on_batch_rotate(self.name, -90))
+            menu.addAction(action_left)
+
+            action_right = QAction(f"↻ 右旋 90°（{self.video_count} 个视频）", self)
+            action_right.triggered.connect(lambda: self.on_batch_rotate(self.name, 90))
+            menu.addAction(action_right)
+
+            menu.exec_(self.mapToGlobal(pos))
+        except Exception as e:
+            print(f"[CollectionItem] 右键菜单异常: {e}")
 
 # ============================================================
 # VideoItem：右侧网格中的单个视频卡片
@@ -289,7 +333,8 @@ class VideoItem(QWidget):
 
     def __init__(self, video_path, video_relative_path, cache_manager,
                  parent=None, on_thumbnail_ready=None,
-                 on_favorite_changed=None, on_double_clicked=None):
+                 on_favorite_changed=None, on_double_clicked=None,
+                 cache_manager_resolver=None):
         super().__init__(parent)
         self.video_path = video_path
         self.video_relative_path = video_relative_path.replace('\\', '/')
@@ -297,6 +342,8 @@ class VideoItem(QWidget):
         self.on_thumbnail_ready = on_thumbnail_ready
         self.on_favorite_changed = on_favorite_changed
         self.on_double_clicked = on_double_clicked
+        # 缓存管理器解析器：返回给定 rel_path 应使用的 CacheManager（支持子目录独立配置）
+        self.cache_manager_resolver = cache_manager_resolver
 
         self.thumbnail_width = THUMBNAIL_SIZE_VIDEO[0]
         self.thumbnail_height = THUMBNAIL_SIZE_VIDEO[1]
@@ -347,21 +394,24 @@ class VideoItem(QWidget):
 
     def _update_fav_button_style(self):
         is_fav = False
-        if self.cache_manager:
-            is_fav = self.cache_manager.is_favorite(self.video_relative_path)
+        cm = self._resolve_cache_manager()
+        if cm:
+            is_fav = cm.is_favorite(self.video_relative_path)
 
         if is_fav:
             self.fav_btn.setStyleSheet(
                 "QPushButton {background-color: rgba(230, 50, 50, 0.92); "
                 "border: 2px solid rgba(255, 80, 80, 0.9); border-radius: 26px; "
-                "color: white; font-size: 28px;}"
+                "padding: 0px;"
+                "color: white; font-size: 42px;}"
                 "QPushButton:hover {background-color: rgba(255, 70, 70, 0.95);}"
             )
         else:
             self.fav_btn.setStyleSheet(
                 "QPushButton {background-color: rgba(40, 40, 60, 0.7); "
                 "border: 2px solid rgba(100, 100, 120, 0.6); border-radius: 26px; "
-                "color: rgba(180, 180, 200, 0.6); font-size: 28px;}"
+                "padding: 0px;"
+                "color: rgba(180, 180, 200, 0.6); font-size: 42px;}"
                 "QPushButton:hover {background-color: rgba(60, 60, 80, 0.8); "
                 "border: 2px solid rgba(150, 150, 170, 0.8); "
                 "color: rgba(220, 220, 240, 0.9);}"
@@ -369,9 +419,10 @@ class VideoItem(QWidget):
         self.fav_btn.setText("♥")
 
     def _on_fav_clicked(self):
-        if not self.cache_manager:
+        cm = self._resolve_cache_manager()
+        if not cm:
             return
-        new_state = self.cache_manager.toggle_favorite(self.video_relative_path)
+        new_state = cm.toggle_favorite(self.video_relative_path)
         self._update_fav_button_style()
         if self.on_favorite_changed:
             self.on_favorite_changed(self.video_relative_path, new_state)
@@ -386,9 +437,10 @@ class VideoItem(QWidget):
             print(f"[VideoItem] 双击事件出错: {e}")
 
     def _on_context_menu(self, pos):
-        """右键菜单：应用内播放 / 以本地播放器打开"""
+        """右键菜单：播放 / 以本地播放器打开 / 左旋90° / 右旋90° / 在资源管理器中浏览"""
         try:
             menu = QMenu(self)
+            menu.setStyleSheet(MENU_QSS)
 
             action_internal = QAction("播放", self)
             action_internal.triggered.connect(
@@ -402,6 +454,16 @@ class VideoItem(QWidget):
 
             menu.addSeparator()
 
+            action_left = QAction("↺ 左旋 90°", self)
+            action_left.triggered.connect(lambda: self._rotate_video(-90))
+            menu.addAction(action_left)
+
+            action_right = QAction("↻ 右旋 90°", self)
+            action_right.triggered.connect(lambda: self._rotate_video(90))
+            menu.addAction(action_right)
+
+            menu.addSeparator()
+
             action_explorer = QAction("在资源管理器中浏览", self)
             action_explorer.triggered.connect(lambda: self._open_in_explorer())
             menu.addAction(action_explorer)
@@ -409,6 +471,34 @@ class VideoItem(QWidget):
             menu.exec_(self.mapToGlobal(pos))
         except Exception as e:
             print(f"[VideoItem] 右键菜单异常: {e}")
+
+    def _rotate_video(self, delta_deg):
+        """旋转单个视频：更新缓存旋转角度 + 清除缓存 + 触发重新生成缩略图"""
+        try:
+            cm = self._resolve_cache_manager()
+            if not cm:
+                return
+            if delta_deg < 0:
+                cm.rotate_left(self.video_relative_path)
+            else:
+                cm.rotate_right(self.video_relative_path)
+            cm.clear_cache_for(self.video_relative_path)
+            # 重置缩略图加载状态，触发重新生成
+            self._thumbnail_loaded = False
+            try:
+                self.thumbnail_label.clear()
+                self.thumbnail_label.setText("🎬")
+            except Exception:
+                pass
+            rotation = 0
+            try:
+                rotation = int(cm.get_rotation(self.video_relative_path)) % 360
+            except Exception:
+                pass
+            if self.on_thumbnail_ready:
+                self.on_thumbnail_ready(self.video_path, self.video_relative_path, self, rotation)
+        except Exception as e:
+            print(f"[VideoItem] 旋转异常: {e}")
 
     def _open_with_system_player(self):
         """优先用第三方播放器；否则回退系统默认关联程序"""
@@ -459,20 +549,15 @@ class VideoItem(QWidget):
         return QSize(THUMBNAIL_SIZE_VIDEO[0] + 20, self.thumbnail_height + 50)
 
     def load_thumbnail(self):
-        """加载缩略图：优先从缓存加载，否则触发异步生成（只执行一次）"""
+        """加载缩略图：优先从缓存加载；否则触发异步生成（按当前旋转角度）"""
         if self._thumbnail_loaded:
             return
         self._thumbnail_loaded = True
-        if not self.cache_manager:
+        cm = self._resolve_cache_manager()
+        if not cm:
             return
 
-        rotation = 0
-        try:
-            rotation = int(self.cache_manager.get_rotation(self.video_relative_path)) % 360
-        except Exception:
-            pass
-
-        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path, rotation)
+        exists, cache_path = cm.cache_exists(self.video_relative_path)
         if exists:
             pixmap = QPixmap(cache_path)
             if not pixmap.isNull():
@@ -483,6 +568,12 @@ class VideoItem(QWidget):
                 self.thumbnail_label.setPixmap(scaled)
                 return
 
+        # 无缓存：获取当前旋转角度并触发生成
+        rotation = 0
+        try:
+            rotation = int(cm.get_rotation(self.video_relative_path)) % 360
+        except Exception:
+            pass
         if self.on_thumbnail_ready:
             self.on_thumbnail_ready(self.video_path, self.video_relative_path, self, rotation)
 
@@ -500,18 +591,19 @@ class VideoItem(QWidget):
     def is_thumbnail_loaded(self):
         return self._thumbnail_loaded
 
+    def _resolve_cache_manager(self):
+        """获取正确的 CacheManager（支持子目录独立配置）"""
+        if self.cache_manager_resolver:
+            return self.cache_manager_resolver(self.video_relative_path)
+        return self.cache_manager
+
     def update_from_cache(self):
-        """缩略图异步生成完成后回调 — 按当前旋转角度查找缓存"""
-        if not self.cache_manager:
+        """缩略图异步生成完成后回调 — 从缓存读取最新缩略图"""
+        cm = self._resolve_cache_manager()
+        if not cm:
             return
 
-        rotation = 0
-        try:
-            rotation = int(self.cache_manager.get_rotation(self.video_relative_path)) % 360
-        except Exception:
-            pass
-
-        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path, rotation)
+        exists, cache_path = cm.cache_exists(self.video_relative_path)
         if exists:
             self._thumbnail_loaded = True
             pixmap = QPixmap(cache_path)
@@ -522,11 +614,16 @@ class VideoItem(QWidget):
                 )
                 self.thumbnail_label.setPixmap(scaled)
         else:
-            # 当前旋转角度没有缓存 — 重置并触发生成（支持旋转后重新生成）
+            # 无缓存 — 重置并触发生成（旋转后若还在排队中会走这里）
             self._thumbnail_loaded = False
             try:
                 self.thumbnail_label.clear()
                 self.thumbnail_label.setText("🎬")
+            except Exception:
+                pass
+            rotation = 0
+            try:
+                rotation = int(cm.get_rotation(self.video_relative_path)) % 360
             except Exception:
                 pass
             if self.on_thumbnail_ready:
@@ -748,12 +845,14 @@ class VideoGridWidget(QWidget):
         if video_relative_path in self.video_items:
             self.video_items[video_relative_path].update_from_cache()
 
-    def add_video(self, video_path, video_relative_path, cache_manager):
+    def add_video(self, video_path, video_relative_path, cache_manager,
+                  cache_manager_resolver=None):
         video_item = VideoItem(
             video_path, video_relative_path, cache_manager,
             on_thumbnail_ready=self.on_thumbnail_requested,
             on_favorite_changed=self.on_favorite_changed_callback,
             on_double_clicked=self.on_double_clicked_callback,
+            cache_manager_resolver=cache_manager_resolver,
         )
         self.video_items[video_relative_path] = video_item
         self.flow_layout.addWidget(video_item)
