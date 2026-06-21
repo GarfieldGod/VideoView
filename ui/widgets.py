@@ -128,14 +128,20 @@ class CollectionItem(QWidget):
         if not self.cache_manager or not self.video_relative_path:
             return
 
-        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path)
+        rotation = 0
+        try:
+            rotation = int(self.cache_manager.get_rotation(self.video_relative_path)) % 360
+        except Exception:
+            pass
+
+        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path, rotation)
         if exists:
             self._set_thumbnail(cache_path)
             return
 
         # 触发异步生成（ThumbnailManager 会在生成完成后通过 update_from_cache 刷新）
         if self.on_thumbnail_ready:
-            self.on_thumbnail_ready(self.video_relative_path)
+            self.on_thumbnail_ready(self.video_relative_path, rotation)
 
     def release_thumbnail(self):
         """释放缩略图（滑出视口时调用，节省内存）"""
@@ -153,15 +159,32 @@ class CollectionItem(QWidget):
         return self._thumbnail_loaded
 
     def update_from_cache(self):
-        """从缓存刷新缩略图（ThumbnailManager 生成完成后调用）"""
-        # 只有已经加载过的项才更新；未加载项下次进入视口时再调用 load_thumbnail
-        if not self._thumbnail_loaded:
-            return
+        """从缓存刷新缩略图（ThumbnailManager 生成完成后调用，或旋转角度改变时调用）"""
+        # 若已加载过则更新；未加载过则现在加载（支持外部强制刷新）
         if not self.cache_manager or not self.video_relative_path:
             return
-        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path)
+
+        rotation = 0
+        try:
+            rotation = int(self.cache_manager.get_rotation(self.video_relative_path)) % 360
+        except Exception:
+            pass
+
+        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path, rotation)
         if exists:
+            self._thumbnail_loaded = True
             self._set_thumbnail(cache_path)
+        else:
+            # 没有对应旋转角度的缓存 — 释放当前缩略图并触发异步生成
+            try:
+                self.thumbnail_label.clear()
+                self.thumbnail_label.setText("📁")
+            except Exception:
+                pass
+            self._thumbnail_loaded = False
+            if self.on_thumbnail_ready:
+                self.on_thumbnail_ready(self.video_relative_path, rotation)
+                self._thumbnail_loaded = True
 
     def _set_thumbnail(self, cache_path):
         """设置缩略图到 label"""
@@ -443,7 +466,13 @@ class VideoItem(QWidget):
         if not self.cache_manager:
             return
 
-        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path)
+        rotation = 0
+        try:
+            rotation = int(self.cache_manager.get_rotation(self.video_relative_path)) % 360
+        except Exception:
+            pass
+
+        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path, rotation)
         if exists:
             pixmap = QPixmap(cache_path)
             if not pixmap.isNull():
@@ -455,7 +484,7 @@ class VideoItem(QWidget):
                 return
 
         if self.on_thumbnail_ready:
-            self.on_thumbnail_ready(self.video_path, self.video_relative_path, self)
+            self.on_thumbnail_ready(self.video_path, self.video_relative_path, self, rotation)
 
     def release_thumbnail(self):
         """滑出视口时释放缩略图内存"""
@@ -472,13 +501,19 @@ class VideoItem(QWidget):
         return self._thumbnail_loaded
 
     def update_from_cache(self):
-        """缩略图异步生成完成后回调——仅当该项仍在视口范围才刷新"""
-        if not self._thumbnail_loaded:
-            return
+        """缩略图异步生成完成后回调 — 按当前旋转角度查找缓存"""
         if not self.cache_manager:
             return
-        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path)
+
+        rotation = 0
+        try:
+            rotation = int(self.cache_manager.get_rotation(self.video_relative_path)) % 360
+        except Exception:
+            pass
+
+        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path, rotation)
         if exists:
+            self._thumbnail_loaded = True
             pixmap = QPixmap(cache_path)
             if not pixmap.isNull():
                 scaled = pixmap.scaled(
@@ -486,6 +521,17 @@ class VideoItem(QWidget):
                     Qt.KeepAspectRatio, Qt.SmoothTransformation,
                 )
                 self.thumbnail_label.setPixmap(scaled)
+        else:
+            # 当前旋转角度没有缓存 — 重置并触发生成（支持旋转后重新生成）
+            self._thumbnail_loaded = False
+            try:
+                self.thumbnail_label.clear()
+                self.thumbnail_label.setText("🎬")
+            except Exception:
+                pass
+            if self.on_thumbnail_ready:
+                self.on_thumbnail_ready(self.video_path, self.video_relative_path, self, rotation)
+                self._thumbnail_loaded = True
 
 
 # ============================================================
@@ -691,12 +737,12 @@ class VideoGridWidget(QWidget):
             parent = parent.parent()
         return None
 
-    def on_thumbnail_requested(self, video_path, video_relative_path, video_item):
-        """请求生成缩略图 — 查找主窗口的 thumbnail_manager 并入队"""
+    def on_thumbnail_requested(self, video_path, video_relative_path, video_item, rotation_deg=0):
+        """请求生成缩略图 — 查找主窗口的 thumbnail_manager 并入队（含旋转角度）"""
         main_window = self.find_main_window()
         if main_window and hasattr(main_window, 'thumbnail_manager') \
                 and main_window.thumbnail_manager:
-            main_window.thumbnail_manager.enqueue(video_path, video_relative_path)
+            main_window.thumbnail_manager.enqueue(video_path, video_relative_path, rotation_deg)
 
     def on_thumbnail_generated(self, video_relative_path):
         if video_relative_path in self.video_items:

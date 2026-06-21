@@ -163,6 +163,40 @@ class MainWindow(QMainWindow):
             if widget:
                 widget.update_from_cache()
 
+    def on_video_rotated(self, video_abs_path, video_relative_path):
+        """视频旋转后回调：重新生成对应旋转角度的缩略图并刷新UI"""
+        rel_path = video_relative_path.replace('\\', '/')
+
+        # 触发异步重新生成（含新的旋转角度）
+        rotation = 0
+        if self.cache_manager:
+            try:
+                rotation = int(self.cache_manager.get_rotation(rel_path)) % 360
+            except Exception:
+                pass
+        if self.thumbnail_manager:
+            self.thumbnail_manager.enqueue(
+                video_abs_path, rel_path, rotation
+            )
+
+        # 同时刷新 UI 中的 item（会按新 rotation 重新查找缓存或触发生成）
+        if hasattr(self, 'right_panel'):
+            if video_relative_path in self.right_panel.video_items:
+                video_item = self.right_panel.video_items[video_relative_path]
+                # 重置 thumbnail_loaded 标志，使 update_from_cache 可以根据新角度检查缓存
+                if hasattr(video_item, '_thumbnail_loaded'):
+                    video_item._thumbnail_loaded = False
+                if hasattr(video_item, 'update_from_cache'):
+                    video_item.update_from_cache()
+
+        # 刷新左侧收藏夹中对应视频的缩略图
+        if video_relative_path in self._collection_thumbnail_items:
+            widget = self._collection_thumbnail_items[video_relative_path]
+            if widget:
+                if hasattr(widget, '_thumbnail_loaded'):
+                    widget._thumbnail_loaded = False
+                widget.update_from_cache()
+
     def on_favorite_changed(self, video_relative_path, new_state):
         if self.cache_manager:
             self.refresh_fav_collection_list()
@@ -266,9 +300,12 @@ class MainWindow(QMainWindow):
             if self.cache_manager:
                 is_marked = self.cache_manager.is_marked(collection['name'])
 
-            # 构造缩略图请求回调
+            # 构造缩略图请求回调（支持旋转角度）
             def make_thumb_callback(vp, vr):
-                return lambda _: self.thumbnail_manager.enqueue(vp, vr) if self.thumbnail_manager else None
+                def _cb(rel_path, rotation_deg=0):
+                    if self.thumbnail_manager:
+                        self.thumbnail_manager.enqueue(vp, rel_path, rotation_deg)
+                return _cb
 
             thumb_callback = None
             if collection['videos'] and self.cache_manager and video_rel:
@@ -325,12 +362,15 @@ class MainWindow(QMainWindow):
         item = QListWidgetItem(self.fav_collection_list)
         item.setSizeHint(QSize(280, 420))
 
-        # 构造缩略图请求回调
+        # 构造缩略图请求回调（支持旋转角度）
         def make_fav_thumb_callback():
             if video_rel and fav_videos:
-                return lambda _: self.thumbnail_manager.enqueue(
-                    fav_videos[0], video_rel
-                ) if self.thumbnail_manager else None
+                def _cb(rel_path, rotation_deg=0):
+                    if self.thumbnail_manager:
+                        self.thumbnail_manager.enqueue(
+                            fav_videos[0], rel_path, rotation_deg
+                        )
+                return _cb
             return None
 
         widget = CollectionItem(
@@ -473,6 +513,7 @@ class MainWindow(QMainWindow):
             player = VideoPlayerWindow(
                 video_list, start_index, self.cache_manager,
                 parent=self, root_folder=self.root_folder,
+                on_video_rotated=self.on_video_rotated,
             )
             player.favorite_changed.connect(self._on_player_favorite_changed)
             self.active_player = player

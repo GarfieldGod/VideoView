@@ -127,39 +127,43 @@ class ThumbnailManager(QThread):
         self.lock = threading.Lock()
         self.pending = set()
 
-    def enqueue(self, video_path, video_relative_path):
+    def enqueue(self, video_path, video_relative_path, rotation_deg=0):
+        deg = int(rotation_deg) % 360
+        # 使用 (相对路径, 旋转角度) 作为去重 key，确保同视频不同旋转都会被处理
+        dedup_key = (video_relative_path.replace('\\', '/'), deg)
         with self.lock:
-            if video_path not in self.pending:
-                self.pending.add(video_path)
-                self.queue.put((video_path, video_relative_path))
+            if dedup_key not in self.pending:
+                self.pending.add(dedup_key)
+                self.queue.put((video_path, video_relative_path, deg))
 
     def process_pending(self):
         while self.running:
             with self.lock:
                 if self.active_count >= self.max_workers or self.queue.empty():
                     return
-                video_path, video_relative_path = self.queue.get()
+                video_path, video_relative_path, deg = self.queue.get()
                 self.active_count += 1
 
             try:
                 target_width = 560
                 target_height = int(target_width * 16 / 9)
-                cache_path = self.cache_manager.get_cache_path(video_relative_path)
+                # 使用旋转角度生成不同的缓存文件
+                cache_path = self.cache_manager.get_cache_path(video_relative_path, deg)
 
                 if not os.path.exists(cache_path):
                     # 延迟导入避免循环依赖
                     from core.thumbnail import generate_video_thumbnail_file
-                    generate_video_thumbnail_file(video_path, target_width, target_height, cache_path)
-                    self.cache_manager.add_cache(video_relative_path, cache_path)
+                    generate_video_thumbnail_file(video_path, target_width, target_height, cache_path, deg)
+                    self.cache_manager.add_cache(video_relative_path, cache_path, deg)
 
-                self.finished.emit(video_relative_path)
+                self.finished.emit(video_relative_path.replace('\\', '/'))
             except Exception as e:
-                print(f"生成缩略图失败 {video_path}: {e}")
+                print(f"生成缩略图失败 {video_path} (rot={deg}°): {e}")
             finally:
                 with self.lock:
                     self.active_count -= 1
-                    if video_path in self.pending:
-                        self.pending.discard(video_path)
+                    pending_key = (video_relative_path.replace('\\', '/'), int(deg))
+                    self.pending.discard(pending_key)
 
     def run(self):
         while self.running:

@@ -73,18 +73,26 @@ class CacheManager:
         except Exception as e:
             print(f"[CacheManager] 保存收藏列表失败: {e}")
 
-    def get_cache_path(self, video_relative_path):
+    def get_cache_path(self, video_relative_path, rotation_deg=0):
         normalized = video_relative_path.replace('\\', '/')
         cache_key = path_hash(normalized)
-        return os.path.join(self.cache_dir, f"{cache_key}.jpg")
+        deg = int(rotation_deg) % 360
+        if deg == 0:
+            return os.path.join(self.cache_dir, f"{cache_key}.jpg")
+        return os.path.join(self.cache_dir, f"{cache_key}_rot{deg}.jpg")
 
-    def cache_exists(self, video_relative_path):
-        cache_path = self.get_cache_path(video_relative_path)
+    def cache_exists(self, video_relative_path, rotation_deg=0):
+        cache_path = self.get_cache_path(video_relative_path, rotation_deg)
         return os.path.exists(cache_path), cache_path
 
-    def add_cache(self, video_relative_path, cache_path):
-        cache_key = path_hash(video_relative_path)
-        self.manifest[video_relative_path] = cache_key
+    def add_cache(self, video_relative_path, cache_path, rotation_deg=0):
+        deg = int(rotation_deg) % 360
+        cache_key = path_hash(video_relative_path.replace('\\', '/'))
+        manifest_key = video_relative_path.replace('\\', '/')
+        if deg == 0:
+            self.manifest[manifest_key] = cache_key
+        else:
+            self.manifest[manifest_key] = f"{cache_key}_rot{deg}"
         self._save_manifest()
 
     def is_favorite(self, video_relative_path):

@@ -28,7 +28,7 @@ class VideoPlayerWindow(QMainWindow):
     favorite_changed = pyqtSignal(str, bool)
 
     def __init__(self, video_paths, start_index=0, cache_manager=None,
-                 parent=None, root_folder=None):
+                 parent=None, root_folder=None, on_video_rotated=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.Window)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
@@ -37,6 +37,7 @@ class VideoPlayerWindow(QMainWindow):
         self.current_index = start_index
         self.cache_manager = cache_manager
         self.root_folder = root_folder.replace('\\', '/') if root_folder else None
+        self._on_video_rotated_cb = on_video_rotated  # 旋转后通知主窗口刷新缩略图
 
         # 播放状态
         self._total_ms = 1
@@ -605,10 +606,11 @@ class VideoPlayerWindow(QMainWindow):
         self.load_video((self.current_index + 1) % len(self.video_paths))
 
     def rotate_video(self, delta_deg):
-        """旋转：更新角度并持久化，然后重建 Media 并 seek 到当前进度"""
+        """旋转：更新角度并持久化，然后重建 Media 并 seek 到当前进度，通知主窗口刷新缩略图"""
+        old_rot = self._rotation
         self._rotation = (int(self._rotation) + int(delta_deg)) % 360
         if self.cache_manager and 0 <= self.current_index < len(self.video_paths):
-            _, rel_path = self.video_paths[self.current_index]
+            abs_path, rel_path = self.video_paths[self.current_index]
             try:
                 if delta_deg < 0:
                     self.cache_manager.rotate_left(rel_path)
@@ -616,6 +618,12 @@ class VideoPlayerWindow(QMainWindow):
                     self.cache_manager.rotate_right(rel_path)
             except Exception:
                 pass
+            # 通知主窗口：旋转角度改变 — 需要重新生成缩略图并刷新UI
+            if self._on_video_rotated_cb:
+                try:
+                    self._on_video_rotated_cb(abs_path, rel_path)
+                except Exception as e:
+                    print(f"[VideoPlayerWindow] on_video_rotated 回调异常: {e}")
 
         if self._backend == 'vlc':
             # VLC：重建 Media + seek 回到当前进度
@@ -623,6 +631,8 @@ class VideoPlayerWindow(QMainWindow):
         elif self._backend == 'opencv' and self._cv_cap is not None:
             # OpenCV：_show_cv_frame 每次都读取 self._rotation，强制刷新当前帧
             self._refresh_cv_frame()
+
+        print(f"[VideoPlayerWindow] 旋转：{old_rot}° → {self._rotation}°（后端：{self._backend}）")
 
     def _reload_current(self):
         """重建当前 Media（保持播放进度和播放状态）——用于旋转角度改变"""

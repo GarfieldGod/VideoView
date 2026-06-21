@@ -11,10 +11,11 @@ THUMBNAIL_SIZE_COLLECTION = (200, int(200 * 16 / 9))   # 收藏夹列表
 THUMBNAIL_SIZE_VIDEO = (560, int(560 * 16 / 9))         # 视频预览网格
 
 
-def generate_video_thumbnail_file(video_path, target_width, target_height, cache_path):
+def generate_video_thumbnail_file(video_path, target_width, target_height,
+                                   cache_path, rotation_deg=0):
     """生成视频缩略图并保存到缓存文件 - 仅使用 cv2
 
-    按 9:16 比例从视频中间裁剪
+    按 9:16 比例从视频中间裁剪；rotation_deg 不为零时应用旋转。
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -37,6 +38,19 @@ def generate_video_thumbnail_file(video_path, target_width, target_height, cache
     if not ret or frame is None:
         raise Exception("无法读取视频帧")
 
+    # ===== 应用旋转（影响后续宽高比计算）=====
+    deg = int(rotation_deg) % 360
+    if deg == 90:
+        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    elif deg == 180:
+        frame = cv2.rotate(frame, cv2.ROTATE_180)
+    elif deg == 270:
+        frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    # 旋转后重新计算宽高（90/270 会交换宽高）
+    video_width = frame.shape[1]
+    video_height = frame.shape[0]
+
     video_aspect = video_width / video_height
     target_aspect = 9 / 16
 
@@ -57,8 +71,9 @@ def generate_video_thumbnail_file(video_path, target_width, target_height, cache
     cv2.imwrite(cache_path, frame)
 
 
-def generate_video_thumbnail(video_path, target_width, target_height=None, cache_path=None):
-    """生成视频缩略图，按 9:16 比例从视频中间裁剪"""
+def generate_video_thumbnail(video_path, target_width, target_height=None,
+                              cache_path=None, rotation_deg=0):
+    """生成视频缩略图，按 9:16 比例从视频中间裁剪；支持旋转"""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise Exception("无法打开视频")
@@ -80,22 +95,32 @@ def generate_video_thumbnail(video_path, target_width, target_height=None, cache
     if not ret or frame is None:
         raise Exception("无法读取视频帧")
 
+    # 应用旋转
+    deg = int(rotation_deg) % 360
+    if deg == 90:
+        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    elif deg == 180:
+        frame = cv2.rotate(frame, cv2.ROTATE_180)
+    elif deg == 270:
+        frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
     if target_height is None:
         target_height = int(target_width * 16 / 9)
 
-    if abs(video_width / video_height - 9 / 16) < 0.01:
+    fw, fh = frame.shape[1], frame.shape[0]
+    video_aspect = fw / fh
+    target_aspect = 9 / 16
+
+    if abs(video_aspect - target_aspect) < 0.01:
         frame = cv2.resize(frame, (target_width, target_height))
     else:
-        video_aspect = video_width / video_height
-        target_aspect = 9 / 16
-
         if video_aspect > target_aspect:
-            crop_width = int(video_height * 9 / 16)
-            crop_x = (video_width - crop_width) // 2
+            crop_width = int(fh * 9 / 16)
+            crop_x = (fw - crop_width) // 2
             frame = frame[:, crop_x:crop_x + crop_width]
         else:
-            crop_height = int(video_width * 16 / 9)
-            crop_y = (video_height - crop_height) // 2
+            crop_height = int(fw * 16 / 9)
+            crop_y = (fh - crop_height) // 2
             frame = frame[crop_y:crop_y + crop_height, :]
 
         frame = cv2.resize(frame, (target_width, target_height))
