@@ -478,10 +478,28 @@ class MainWindow(QMainWindow):
 
         progress.close()
 
+        # ===== 关键：让 self.collections 的顺序与 UI 显示顺序保持一致。
+        # 原因：marked collections 被 UI 排序为「未标记在前，标记在后」。
+        # 若不将 self.collections 重新排序，播放器的跨收藏夹播放时
+        # 与 UI 显示顺序会错位。
+        if self.cache_manager:
+            unmarked = []
+            marked = []
+            for c in self.collections:
+                try:
+                    if self.cache_manager.is_marked(c['name']):
+                        marked.append(c)
+                    else:
+                        unmarked.append(c)
+                except Exception:
+                    unmarked.append(c)
+            self.collections = unmarked + marked
+
         self.populate_collection_list()
         self.populate_fav_collection_list()
-        # 扫描完成后，默认打开列表中的第一个收藏夹（与用户点击一致的体验）
-        self._auto_open_first_collection(0)
+        # 扫描完成后，若存在上次播放记录，则自动定位到对应的收藏夹，
+        # 否则默认打开列表中的第一个收藏夹。
+        self._auto_open_last_played_or_first()
 
     def populate_collection_list(self):
         self.collection_list.clear()
@@ -684,6 +702,86 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"自动打开第一个收藏夹失败: {e}")
 
+    def _auto_open_last_played_or_first(self):
+        """优先打开「上次播放位置」所在的收藏夹，否则打开第一个收藏夹。"""
+        try:
+            if self.cache_manager is None:
+                self._auto_open_first_collection(0)
+                return
+            last = self.cache_manager.get_last_played()
+            if not last or not last.get('rel_path'):
+                self._auto_open_first_collection(0)
+                return
+            last_rel = str(last['rel_path']).replace('\\', '/')
+            last_coll = last.get('collection_name')
+
+            # 优先按 collection_name 匹配（无论是根目录还是批量收藏的命名）
+            if last_coll:
+                # 先尝试在根目录的 collections 中匹配
+                for idx, c in enumerate(self.collections):
+                    if c['name'] == last_coll:
+                        # 选中 + 打开
+                        try:
+                            if 0 <= idx < self.collection_list.count():
+                                item = self.collection_list.item(idx)
+                                if item:
+                                    self.collection_list.setCurrentItem(item)
+                                    widget = self.collection_list.itemWidget(item)
+                                    if widget and hasattr(widget, 'load_thumbnail'):
+                                        widget.load_thumbnail()
+                        except Exception:
+                            pass
+                        self.show_videos(c)
+                        return
+                # 再尝试在最爱列表中匹配
+                try:
+                    fav_names = self._get_fav_names_ordered()
+                    if last_coll in fav_names:
+                        idx = fav_names.index(last_coll)
+                        try:
+                            if 0 <= idx < self.fav_collection_list.count():
+                                item = self.fav_collection_list.item(idx)
+                                if item:
+                                    self.fav_collection_list.setCurrentItem(item)
+                                    widget = self.fav_collection_list.itemWidget(item)
+                                    if widget and hasattr(widget, 'load_thumbnail'):
+                                        widget.load_thumbnail()
+                        except Exception:
+                            pass
+                        if last_coll == '默认收藏夹':
+                            self.show_default_favorites()
+                        else:
+                            self.show_named_collection(last_coll)
+                        return
+                except Exception:
+                    pass
+
+            # 兜底：按 last_rel 路径匹配某个 collection
+            for idx, c in enumerate(self.collections):
+                for vp in c.get('videos', []):
+                    try:
+                        rp = os.path.relpath(vp, self.root_folder).replace('\\', '/')
+                        if rp == last_rel:
+                            try:
+                                if 0 <= idx < self.collection_list.count():
+                                    item = self.collection_list.item(idx)
+                                    if item:
+                                        self.collection_list.setCurrentItem(item)
+                            except Exception:
+                                pass
+                            self.show_videos(c)
+                            return
+                    except Exception:
+                        continue
+            # 没有找到匹配的收藏夹，退化到打开第一个
+            self._auto_open_first_collection(0)
+        except Exception as e:
+            print(f"[MainWindow] _auto_open_last_played_or_first 异常: {e}")
+            try:
+                self._auto_open_first_collection(0)
+            except Exception:
+                pass
+
     def on_collection_clicked(self, item):
         self.current_tab = 0
         widget = self.collection_list.itemWidget(item)
@@ -737,6 +835,55 @@ class MainWindow(QMainWindow):
                 video_path, video_relative_path, self.cache_manager,
             )
 
+        # 处理「上次播放位置」高亮 + 滚动（延迟到布局完成后）
+        self._apply_last_played_hint(mode=0)
+
+    def _apply_last_played_hint(self, mode):
+        """在当前网格中查找是否存在「最近播放」的视频，若有则高亮并滚动到它。
+
+        mode=0 表示当前展示的是根目录收藏夹；
+        mode=1 表示当前展示的是最爱列表中的收藏夹。
+        """
+        try:
+            if self.cache_manager is None:
+                return
+            last = self.cache_manager.get_last_played()
+            if not last or not last.get('rel_path'):
+                return
+            last_rel = str(last['rel_path']).replace('\\', '/')
+
+            # 根据 mode 做过滤检查：
+            # mode=0 (根目录) 时，只在 root_folder 来源的视频应用高亮；
+            # mode=1 (最爱) 时，仅当 last_played 的 collection_name 属于 named collections
+            # 或当 last_rel 在当前 current_video_list 中时才应用。
+            last_coll = last.get('collection_name')
+            current_coll = getattr(self, '_current_collection_name', None)
+
+            if mode == 0:
+                # 当浏览根目录收藏夹时，必须 last_played 的 collection 与当前
+                # collection 匹配，或 last_rel 出现在当前 current_video_list 中。
+                if last_coll and current_coll and last_coll != current_coll:
+                    # 这里不同 collection，但如果用户明确浏览了另一个收藏夹，
+                    # 我们仍然高亮 current_coll，不做全局滚动。
+                    return
+                # 兜底：仅当 last_rel 出现在当前 current_video_list 时才应用
+                in_current = any(rp == last_rel for _, rp in self.current_video_list)
+                if not in_current:
+                    return
+
+            # 高亮 + 滚动
+            found = self.right_panel.highlight_last_played(last_rel)
+            if found:
+                # 布局完成后再滚动（稍作延迟，避免 layout 未完成造成坐标不正确）
+                try:
+                    from PyQt5.QtCore import QTimer
+                    QTimer.singleShot(50, lambda: self.right_panel.scroll_to_video(last_rel))
+                except Exception:
+                    # QTimer 不可用时，直接同步滚动
+                    self.right_panel.scroll_to_video(last_rel)
+        except Exception as e:
+            print(f"[MainWindow] _apply_last_played_hint 异常: {e}")
+
     def _get_fav_names_ordered(self):
         """返回当前最爱列表中显示的收藏夹名有序列表（与左侧列表一致）"""
         if not self.cache_manager:
@@ -746,6 +893,7 @@ class MainWindow(QMainWindow):
     def show_default_favorites(self):
         self.current_tab = 1
         self.right_panel.clear_videos()
+        self._current_collection_name = '默认收藏夹'
 
         fav_names = self._get_fav_names_ordered()
         try:
@@ -779,10 +927,13 @@ class MainWindow(QMainWindow):
                 video_path, video_relative_path, self.cache_manager,
             )
 
+        self._apply_last_played_hint(mode=1)
+
     def show_named_collection(self, name):
         """在最爱列表中显示某个命名收藏夹（支持"默认收藏夹"或批量收藏的命名收藏夹）"""
         self.current_tab = 1
         self.right_panel.clear_videos()
+        self._current_collection_name = name
 
         fav_names = self._get_fav_names_ordered()
         try:
@@ -823,6 +974,8 @@ class MainWindow(QMainWindow):
             self.right_panel.add_video(
                 video_path, video_relative_path, self.cache_manager,
             )
+
+        self._apply_last_played_hint(mode=1)
 
     # ------------------------------------------------------------
     # 上下收藏夹切换（标题栏 ◀ ▶ 按钮）
@@ -916,6 +1069,7 @@ class MainWindow(QMainWindow):
         if not self.current_video_list:
             video_list = [(video_path, video_relative_path)]
             start_index = 0
+            current_collection_name = getattr(self, '_current_collection_name', None)
         else:
             video_list = list(self.current_video_list)
             start_index = 0
@@ -923,24 +1077,147 @@ class MainWindow(QMainWindow):
                 if rp == video_relative_path or vp == video_path:
                     start_index = i
                     break
+            current_collection_name = getattr(self, '_current_collection_name', None)
 
         try:
             player = VideoPlayerWindow(
                 video_list, start_index, self.cache_manager,
                 parent=self, root_folder=self.root_folder,
                 on_video_rotated=self.on_video_rotated,
+                collection_name=current_collection_name,
+                on_get_next_collection_videos=self._on_player_next_collection,
+                on_get_prev_collection_videos=self._on_player_prev_collection,
             )
             player.favorite_changed.connect(self._on_player_favorite_changed)
+            player.last_played_changed.connect(self._on_last_played_changed)
             self.active_player = player
             player.show()
         except Exception as e:
             print(f"打开播放器失败: {e}")
+
+    def _on_player_next_collection(self):
+        """播放器请求下一个收藏夹的视频列表。
+
+        返回 (video_list, collection_name) 或 None。
+        同时在主窗口中同步切换到对应收藏夹（同步左侧列表 + 刷新右侧网格）。
+        """
+        try:
+            if self.current_tab == 0:
+                # 根目录：下一个 collection
+                idx = getattr(self, '_current_root_index', None)
+                if idx is None or idx >= len(self.collections) - 1:
+                    return None
+                target_idx = idx + 1
+                target = self.collections[target_idx]
+                # 同步主窗口的当前选中状态与右侧内容（但不破坏播放器）
+                try:
+                    if 0 <= target_idx < self.collection_list.count():
+                        item = self.collection_list.item(target_idx)
+                        if item:
+                            self.collection_list.setCurrentItem(item)
+                except Exception:
+                    pass
+                self.show_videos(target)
+                # 返回该 collection 的视频列表
+                vlist = []
+                for video_path in target['videos']:
+                    rp = os.path.relpath(video_path, self.root_folder).replace('\\', '/')
+                    vlist.append((video_path, rp))
+                return (vlist, target['name'])
+            else:
+                # 最爱列表：下一个命名收藏夹
+                fav_names = self._get_fav_names_ordered()
+                idx = getattr(self, '_current_fav_index', None)
+                if idx is None or idx >= len(fav_names) - 1:
+                    return None
+                target_idx = idx + 1
+                target_name = fav_names[target_idx]
+                try:
+                    if 0 <= target_idx < self.fav_collection_list.count():
+                        item = self.fav_collection_list.item(target_idx)
+                        if item:
+                            self.fav_collection_list.setCurrentItem(item)
+                except Exception:
+                    pass
+                # 刷新主窗口右侧（显示该 named collection 的内容）
+                if target_name == '默认收藏夹':
+                    self.show_default_favorites()
+                else:
+                    self.show_named_collection(target_name)
+                # 返回当前 video_list（show_* 会更新 current_video_list）
+                if self.current_video_list:
+                    return (list(self.current_video_list), target_name)
+                return None
+        except Exception as e:
+            print(f"[MainWindow] _on_player_next_collection 异常: {e}")
+            return None
+
+    def _on_player_prev_collection(self):
+        """播放器请求上一个收藏夹的视频列表。
+
+        返回 (video_list, collection_name) 或 None。
+        """
+        try:
+            if self.current_tab == 0:
+                idx = getattr(self, '_current_root_index', None)
+                if idx is None or idx <= 0 or not self.collections:
+                    return None
+                target_idx = idx - 1
+                target = self.collections[target_idx]
+                try:
+                    if 0 <= target_idx < self.collection_list.count():
+                        item = self.collection_list.item(target_idx)
+                        if item:
+                            self.collection_list.setCurrentItem(item)
+                except Exception:
+                    pass
+                self.show_videos(target)
+                vlist = []
+                for video_path in target['videos']:
+                    rp = os.path.relpath(video_path, self.root_folder).replace('\\', '/')
+                    vlist.append((video_path, rp))
+                return (vlist, target['name'])
+            else:
+                fav_names = self._get_fav_names_ordered()
+                idx = getattr(self, '_current_fav_index', None)
+                if idx is None or idx <= 0 or not fav_names:
+                    return None
+                target_idx = idx - 1
+                target_name = fav_names[target_idx]
+                try:
+                    if 0 <= target_idx < self.fav_collection_list.count():
+                        item = self.fav_collection_list.item(target_idx)
+                        if item:
+                            self.fav_collection_list.setCurrentItem(item)
+                except Exception:
+                    pass
+                if target_name == '默认收藏夹':
+                    self.show_default_favorites()
+                else:
+                    self.show_named_collection(target_name)
+                if self.current_video_list:
+                    return (list(self.current_video_list), target_name)
+                return None
+        except Exception as e:
+            print(f"[MainWindow] _on_player_prev_collection 异常: {e}")
+            return None
 
     def _on_player_favorite_changed(self, video_relative_path, new_state):
         if self.cache_manager:
             self.refresh_fav_collection_list()
         if self.current_tab == 1:
             self.show_default_favorites()
+
+    def _on_last_played_changed(self, video_relative_path):
+        """当播放器更新「上次播放位置」时，实时刷新右侧视频预览网格的高亮。"""
+        try:
+            if self.right_panel is not None:
+                self.right_panel.highlight_last_played(video_relative_path)
+        except Exception as e:
+            try:
+                print(f"[MainWindow] _on_last_played_changed 异常: {e}")
+            except Exception:
+                pass
 
     def closeEvent(self, event):
         # 保存当前窗口状态（最大化/尺寸/位置）到 app_config.json

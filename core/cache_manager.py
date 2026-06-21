@@ -52,11 +52,15 @@ class CacheManager:
 
         self.manifest_path = os.path.join(cache_dir, 'cache_manifest.json')
         # favorites.json 放在 .videoview 根目录
-        self.favorites_path = os.path.join(os.path.dirname(cache_dir), 'favorites.json')
+        self.videoview_root = os.path.dirname(cache_dir)
+        self.favorites_path = os.path.join(self.videoview_root, 'favorites.json')
+        # config.json：记录最近播放等状态（保存在 .videoview 根目录）
+        self.config_path = os.path.join(self.videoview_root, 'config.json')
         self.manifest = self._load_manifest()
         self.favorites = self._load_favorites()
         self.marked_collections = self._load_marked_collections()
         self.rotations = self._load_rotations()
+        self.config = self._load_config()
 
     # ------------------------------------------------------------
     # 路径归一化（核心逻辑）
@@ -376,3 +380,63 @@ class CacheManager:
         new_deg = (current + 90) % 360
         self.set_rotation(video_relative_path, new_deg)
         return new_deg
+
+    # ------------------------------------------------------------
+    # 根目录配置文件（.videoview/config.json）
+    # 记录：最近播放的视频、所在收藏夹等
+    # ------------------------------------------------------------
+
+    def _load_config(self):
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+            except Exception as e:
+                print(f"[CacheManager] 加载根目录配置失败: {e}")
+        return {}
+
+    def _save_config(self):
+        try:
+            makedirs_hidden(os.path.dirname(self.config_path))
+            with open_for_write(self.config_path, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[CacheManager] 保存根目录配置失败: {e}")
+
+    def set_last_played(self, video_relative_path, video_abs_path=None,
+                         collection_name=None):
+        """记录最近一次播放的视频信息。
+
+        Args:
+            video_relative_path: 相对 root_folder 的相对路径（如 "A/B/x.mp4"）
+            video_abs_path: 可选，绝对路径（冗余记录，便于调试）
+            collection_name: 可选，所在的收藏夹名
+        """
+        try:
+            from datetime import datetime, timezone
+            now_iso = datetime.now().astimezone().isoformat()
+        except Exception:
+            now_iso = ""
+        last = {}
+        if video_relative_path:
+            last['rel_path'] = video_relative_path.replace('\\', '/')
+        if video_abs_path:
+            last['abs_path'] = video_abs_path.replace('\\', '/')
+        if collection_name:
+            last['collection_name'] = collection_name
+        last['time'] = now_iso
+
+        self.config['last_played'] = last
+        self._save_config()
+
+    def get_last_played(self):
+        """返回最近播放记录（dict）或 None。
+
+        键：rel_path, abs_path, collection_name, time
+        """
+        data = self.config.get('last_played')
+        if isinstance(data, dict) and data.get('rel_path'):
+            return data
+        return None

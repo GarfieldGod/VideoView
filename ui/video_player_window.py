@@ -26,9 +26,14 @@ class VideoPlayerWindow(QMainWindow):
     """应用内播放器"""
 
     favorite_changed = pyqtSignal(str, bool)
+    # 最近播放位置发生变更：发射 rel_path（相对 root_folder 的路径）
+    last_played_changed = pyqtSignal(str)
 
     def __init__(self, video_paths, start_index=0, cache_manager=None,
-                 parent=None, root_folder=None, on_video_rotated=None):
+                 parent=None, root_folder=None, on_video_rotated=None,
+                 collection_name=None,
+                 on_get_next_collection_videos=None,
+                 on_get_prev_collection_videos=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.Window)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
@@ -38,6 +43,10 @@ class VideoPlayerWindow(QMainWindow):
         self.cache_manager = cache_manager
         self.root_folder = root_folder.replace('\\', '/') if root_folder else None
         self._on_video_rotated_cb = on_video_rotated  # 旋转后通知主窗口刷新缩略图
+        self._collection_name = collection_name  # 当前播放的收藏夹名
+        # 跨收藏集导航回调：签名 on_get_next_collection_videos() -> (video_list, collection_name) 或 None
+        self._on_get_next_collection_videos = on_get_next_collection_videos
+        self._on_get_prev_collection_videos = on_get_prev_collection_videos
 
         # 播放状态
         self._total_ms = 1
@@ -404,12 +413,16 @@ class VideoPlayerWindow(QMainWindow):
         abs_path, rel_path = self.video_paths[index]
         self.filename_label.setText(os.path.basename(abs_path))
         self._update_fav_button()
+        self._update_title()
 
         if self.cache_manager is not None:
             try:
                 self._rotation = int(self.cache_manager.get_rotation(rel_path)) % 360
             except Exception:
                 self._rotation = 0
+
+        # 记录为最近一次播放的视频（写入根目录 .videoview/config.json）
+        self._save_last_played(rel_path, abs_path)
 
         self._current_ms = 0
         self.progress_slider.setRange(0, 1)
@@ -422,6 +435,34 @@ class VideoPlayerWindow(QMainWindow):
             self._load_vlc(abs_path)
         else:
             self._load_cv(abs_path)
+
+    def _save_last_played(self, rel_path, abs_path):
+        """记录最近播放的视频信息到根目录 .videoview/config.json
+
+        同时发射 last_played_changed 信号，让主窗口的视频预览网格实时刷新高亮。
+        """
+        if self.cache_manager is None and not hasattr(self, 'root_folder'):
+            return
+        try:
+            if self.cache_manager is not None:
+                # 通过 cache_manager 的便捷接口写入
+                self.cache_manager.set_last_played(
+                    rel_path, abs_path, self._collection_name
+                )
+        except Exception as e:
+            try:
+                print(f"[VideoPlayerWindow] 记录最近播放位置失败: {e}")
+            except Exception:
+                pass
+        # 发射信号，让主窗口的视频网格刷新高亮（即使 cache_manager 写失败也尝试）
+        try:
+            if rel_path:
+                self.last_played_changed.emit(str(rel_path))
+        except Exception as e:
+            try:
+                print(f"[VideoPlayerWindow] 发射 last_played_changed 异常: {e}")
+            except Exception:
+                pass
 
     def _load_vlc(self, abs_path):
         """VLC 渲染：创建带旋转滤镜的 Media → set_media → set_hwnd → play"""
@@ -693,14 +734,60 @@ class VideoPlayerWindow(QMainWindow):
                     self._cv_timer.start(interval)
                 self.btn_play.setText("暂停")
 
+    def _update_title(self):
+        """根据当前视频与收藏夹名更新窗口标题"""
+        try:
+            if 0 <= self.current_index < len(self.video_paths):
+                abs_path = self.video_paths[self.current_index][0]
+                file_name = os.path.basename(abs_path)
+                parts = []
+                if self._collection_name:
+                    parts.append(f"[{self._collection_name}]")
+                parts.append(f"{self.current_index + 1}/{len(self.video_paths)} {file_name}")
+                self.setWindowTitle("  ".join(parts))
+                return
+        except Exception:
+            pass
+        self.setWindowTitle("视频播放器")
+
     def play_previous(self):
         if len(self.video_paths) == 0:
             return
+        # 若当前已是第一个视频，则尝试切换到上一个收藏夹的最后一个视频
+        if self.current_index == 0 and self._on_get_prev_collection_videos is not None:
+            try:
+                result = self._on_get_prev_collection_videos()
+                if result and len(result) >= 1:
+                    prev_videos = result[0]
+                    if prev_videos and len(prev_videos) > 0:
+                        new_coll_name = result[1] if len(result) >= 2 else None
+                        self.video_paths = prev_videos
+                        self._collection_name = new_coll_name
+                        self.load_video(len(prev_videos) - 1)
+                        return
+            except Exception as e:
+                print(f"[VideoPlayerWindow] 获取上一个收藏集视频列表失败: {e}")
+        # 正常：在当前收藏集内循环
         self.load_video((self.current_index - 1) % len(self.video_paths))
 
     def play_next(self):
         if len(self.video_paths) == 0:
             return
+        # 若当前已是最后一个视频，则尝试切换到下一个收藏夹的第一个视频
+        if self.current_index == len(self.video_paths) - 1 and self._on_get_next_collection_videos is not None:
+            try:
+                result = self._on_get_next_collection_videos()
+                if result and len(result) >= 1:
+                    next_videos = result[0]
+                    if next_videos and len(next_videos) > 0:
+                        new_coll_name = result[1] if len(result) >= 2 else None
+                        self.video_paths = next_videos
+                        self._collection_name = new_coll_name
+                        self.load_video(0)
+                        return
+            except Exception as e:
+                print(f"[VideoPlayerWindow] 获取下一个收藏集视频列表失败: {e}")
+        # 正常：在当前收藏集内循环
         self.load_video((self.current_index + 1) % len(self.video_paths))
 
     def rotate_video(self, delta_deg):

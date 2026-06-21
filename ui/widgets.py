@@ -391,6 +391,7 @@ class VideoItem(QWidget):
         self.thumbnail_width = THUMBNAIL_SIZE_VIDEO[0]
         self.thumbnail_height = THUMBNAIL_SIZE_VIDEO[1]
         self._thumbnail_loaded = False
+        self._is_last_played = False
 
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
@@ -417,6 +418,24 @@ class VideoItem(QWidget):
         self.thumbnail_label.setAlignment(Qt.AlignCenter)
         self.thumbnail_label.setText("🎬")
 
+        # 「上次播放位置」标签（高亮时显示，默认隐藏）
+        # 大尺寸绿色底白字，醒目提示用户这是最近播放的位置
+        self.last_played_label = QLabel("上次播放位置", thumb_container)
+        self.last_played_label.setFixedHeight(68)  # 约为原来2.4倍
+        self.last_played_label.setFixedWidth(232)
+        self.last_played_label.setStyleSheet(
+            "QLabel {background-color: #22aa33; "  # 绿色背景
+            "color: #ffffff; font-size: 34px; font-weight: bold; "  # 白字+放大约2.4倍
+            "padding: 0px 0px; border-radius: 15px;}"
+        )
+        self.last_played_label.setAlignment(Qt.AlignCenter)
+        self.last_played_label.hide()
+
+        # 将「上次播放位置」标签放在缩略图底部
+        self.last_played_label.move(
+            20, self.thumbnail_height - self.last_played_label.height() - 20
+        )
+
         self.fav_btn = QPushButton(thumb_container)
         self.fav_btn.setFixedSize(52, 52)
         self.fav_btn.move(self.thumbnail_width - 58, 6)
@@ -434,6 +453,32 @@ class VideoItem(QWidget):
         layout.addWidget(thumb_container)
         layout.addWidget(self.name_label)
         self.setFixedWidth(THUMBNAIL_SIZE_VIDEO[0] + 20)
+
+    def set_last_played(self, is_last):
+        """设置为 / 取消 最近一次播放的视频卡片"""
+        if getattr(self, '_is_last_played', False) == bool(is_last):
+            return
+        self._is_last_played = bool(is_last)
+        try:
+            if self._is_last_played:
+                # 绿色高亮边框（约为原来的 2-3 倍粗）+ 显示绿色大字标签
+                self.thumbnail_label.setStyleSheet(
+                    "QLabel {background-color: #2a2a44; border-radius: 15px; "
+                    "border: 10px solid #22aa33; color: #888; font-size: 24px;}"
+                )
+                self.last_played_label.show()
+                self.setStyleSheet(
+                    "QWidget {background-color: transparent;}"
+                )
+            else:
+                # 恢复默认样式
+                self.thumbnail_label.setStyleSheet(
+                    "QLabel {background-color: #2a2a44; border-radius: 8px; "
+                    "border: 1px solid #4a4a6a; color: #888; font-size: 24px;}"
+                )
+                self.last_played_label.hide()
+        except Exception as e:
+            print(f"[VideoItem] set_last_played 异常: {e}")
 
     def _update_fav_button_style(self):
         is_fav = False
@@ -975,6 +1020,86 @@ class VideoGridWidget(QWidget):
                     hsb.setValue(hsb.minimum() if hasattr(hsb, 'minimum') else 0)
         except Exception:
             pass
+
+    def highlight_last_played(self, video_relative_path):
+        """将指定视频标记为「上次播放位置」，其他视频取消该状态。
+
+        返回 True 表示在当前网格中找到了对应视频。
+        """
+        if not video_relative_path:
+            for key, item in self.video_items.items():
+                try:
+                    if item is not None and hasattr(item, 'set_last_played'):
+                        item.set_last_played(False)
+                except Exception:
+                    continue
+            return False
+
+        target_rel = video_relative_path.replace('\\', '/')
+        found = False
+        for key, item in self.video_items.items():
+            try:
+                if item is None or not hasattr(item, 'set_last_played'):
+                    continue
+                item_rel = getattr(item, 'video_relative_path', None)
+                if item_rel and item_rel.replace('\\', '/') == target_rel:
+                    item.set_last_played(True)
+                    found = True
+                else:
+                    item.set_last_played(False)
+            except Exception:
+                continue
+        return found
+
+    def scroll_to_video(self, video_relative_path):
+        """将视图滚动到指定视频所在位置。
+
+        用于打开根目录后定位到最近播放的视频。
+        """
+        if not video_relative_path:
+            return
+        target_rel = video_relative_path.replace('\\', '/')
+        try:
+            item = self.video_items.get(target_rel)
+            if item is None:
+                # 做兜底搜索：遍历所有项匹配相对路径
+                for key, it in self.video_items.items():
+                    try:
+                        if it is None:
+                            continue
+                        item_rel = getattr(it, 'video_relative_path', None)
+                        if item_rel and item_rel.replace('\\', '/') == target_rel:
+                            item = it
+                            break
+                    except Exception:
+                        continue
+            if item is None:
+                return
+            # 定位到该 item：使用 geometry() 相对坐标
+            vp = self.scroll_area.viewport()
+            if vp is None:
+                return
+            parent_widget = item.parentWidget()
+            # 在 scroll_area 的内容坐标系中计算目标位置
+            try:
+                # item 在 content_widget 中的相对位置
+                pos_in_content = item.mapTo(self.content_widget, item.rect().topLeft())
+            except Exception:
+                pos_in_content = item.pos()
+            # 滚动到视频项，让其出现在视口中央
+            self.scroll_area.verticalScrollBar().setValue(
+                max(0, pos_in_content.y() - vp.height() // 3)
+            )
+            self.scroll_area.horizontalScrollBar().setValue(
+                max(0, pos_in_content.x() - vp.width() // 3)
+            )
+            # 延迟刷新缩略图
+            try:
+                self._pending_refresh_timer.start()
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[VideoGridWidget] scroll_to_video 异常: {e}")
 
     def find_main_window(self):
         from PyQt5.QtWidgets import QMainWindow
