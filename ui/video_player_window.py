@@ -47,6 +47,7 @@ class VideoPlayerWindow(QMainWindow):
         self._slider_seeking = False
         self._muted = False
         self._closed = False
+        self._closing = False  # 窗口正在关闭，阻止所有定时器回调
 
         # OpenCV 回退
         self._cv_cap = None
@@ -298,7 +299,7 @@ class VideoPlayerWindow(QMainWindow):
 
     def _on_vlc_tick(self):
         """每 250ms 更新 VLC 进度条"""
-        if self._vlc_player is None or self._closed:
+        if self._closing or self._vlc_player is None or self._closed:
             return
         try:
             state = self._vlc_player.get_state()
@@ -333,6 +334,8 @@ class VideoPlayerWindow(QMainWindow):
     # 视频加载
     # ------------------------------------------------------------
     def load_video(self, index):
+        if self._closing:
+            return
         if not (0 <= index < len(self.video_paths)):
             return
         self.current_index = index
@@ -360,7 +363,7 @@ class VideoPlayerWindow(QMainWindow):
 
     def _load_vlc(self, abs_path):
         """VLC 渲染：创建带旋转滤镜的 Media → set_media → set_hwnd → play"""
-        if self._closed:
+        if self._closing or self._closed:
             return
         try:
             if self._vlc_player is None:
@@ -413,7 +416,7 @@ class VideoPlayerWindow(QMainWindow):
 
     def _load_cv(self, abs_path):
         """OpenCV 逐帧播放（VLC 不可用时）"""
-        if self._closed:
+        if self._closing or self._closed:
             return
         try:
             if self._cv_timer:
@@ -477,7 +480,7 @@ class VideoPlayerWindow(QMainWindow):
             self._display_label.setText("加载失败")
 
     def _on_cv_tick(self):
-        if self._cv_cap is None or not self._is_playing or self._closed:
+        if self._closing or self._cv_cap is None or not self._is_playing or self._closed:
             return
         try:
             ret, frame = self._cv_cap.read()
@@ -552,7 +555,7 @@ class VideoPlayerWindow(QMainWindow):
 
     def _refresh_cv_frame(self):
         """强制刷新 OpenCV 当前帧（读取并重新显示当前帧，带当前 rotation）"""
-        if self._cv_cap is None:
+        if self._closing or self._cv_cap is None:
             return
         try:
             cur_ms = self._current_ms
@@ -607,6 +610,8 @@ class VideoPlayerWindow(QMainWindow):
 
     def rotate_video(self, delta_deg):
         """旋转：更新角度并持久化，然后重建 Media 并 seek 到当前进度，通知主窗口刷新缩略图"""
+        if self._closing:
+            return
         old_rot = self._rotation
         self._rotation = (int(self._rotation) + int(delta_deg)) % 360
         if self.cache_manager and 0 <= self.current_index < len(self.video_paths):
@@ -636,7 +641,7 @@ class VideoPlayerWindow(QMainWindow):
 
     def _reload_current(self):
         """重建当前 Media（保持播放进度和播放状态）——用于旋转角度改变"""
-        if self._closed or not (0 <= self.current_index < len(self.video_paths)):
+        if self._closing or self._closed or not (0 <= self.current_index < len(self.video_paths)):
             return
         was_playing = self._is_playing
         cur_ms = max(0, int(self._current_ms))
@@ -695,7 +700,7 @@ class VideoPlayerWindow(QMainWindow):
 
     def _seek_to(self, target_ms):
         """统一跳转入口"""
-        if self._closed:
+        if self._closing or self._closed:
             return
         target_ms = max(0, int(target_ms))
         if self._backend == 'vlc' and self._vlc_player:
@@ -716,6 +721,8 @@ class VideoPlayerWindow(QMainWindow):
 
     def _apply_volume(self):
         """应用音量到 VLC 并持久化到 app_config.json"""
+        if self._closing:
+            return
         vol = 0 if self._muted else max(0, min(100, int(self._volume)))
         try:
             self.volume_slider.blockSignals(True)
@@ -833,7 +840,15 @@ class VideoPlayerWindow(QMainWindow):
         self._seek_to(target)
 
     def closeEvent(self, event):
-        # 先取消所有 pending timers，防止它们在窗口关闭后触发
+        # 第一步：只设置标志、停止所有定时器、隐藏窗口，然后立即返回
+        # 避免在主线程执行可能阻塞的资源释放操作
+        if self._closing:
+            # 已经在异步清理中，接受关闭
+            event.accept()
+            return
+        self._closing = True
+
+        # 取消所有 pending timers（Qt 定时器 stop() 是安全的，不会阻塞）
         for timer in self._pending_timers:
             try:
                 timer.stop()
@@ -843,17 +858,83 @@ class VideoPlayerWindow(QMainWindow):
 
         self._closed = True
         if self._vlc_timer:
-            self._vlc_timer.stop()
+            try:
+                self._vlc_timer.stop()
+            except Exception:
+                pass
         if self._cv_timer:
-            self._cv_timer.stop()
-        if self._vlc_player:
+            try:
+                self._cv_timer.stop()
+            except Exception:
+                pass
+
+        # 隐藏窗口，让用户觉得窗口已经关闭
+        try:
+            self.hide()
+        except Exception:
+            pass
+
+        # 忽略当前 closeEvent，用异步定时器在后台释放资源
+        event.ignore()
+        cleanup_timer = QTimer(self)
+        cleanup_timer.setSingleShot(True)
+        cleanup_timer.timeout.connect(self._async_cleanup)
+        cleanup_timer.start(30)
+
+    def _async_cleanup(self):
+        """异步清理资源：分步骤通过 QTimer 调度，每步之间让出事件循环，避免死锁。
+        步骤：解绑窗口 → 停止 VLC → 释放 OpenCV → 清空显示 → 销毁窗口"""
+        # 步骤 1：解绑 VLC 渲染窗口句柄（关键：防止 VLC 回调已销毁的窗口）
+        if self._vlc_player is not None:
+            try:
+                import ctypes
+                self._vlc_player.set_hwnd(ctypes.c_void_p(0))
+            except Exception:
+                pass
+
+        # 步骤 2：通过 QTimer 下一步（让出事件循环）
+        t2 = QTimer(self)
+        t2.setSingleShot(True)
+        t2.timeout.connect(self._async_cleanup_step2)
+        t2.start(10)
+
+    def _async_cleanup_step2(self):
+        # 停止 VLC 播放
+        if self._vlc_player is not None:
             try:
                 self._vlc_player.stop()
             except Exception:
                 pass
-        if self._cv_cap:
+        t = QTimer(self)
+        t.setSingleShot(True)
+        t.timeout.connect(self._async_cleanup_step3)
+        t.start(10)
+
+    def _async_cleanup_step3(self):
+        # 释放 OpenCV 捕获对象
+        if self._cv_cap is not None:
             try:
                 self._cv_cap.release()
             except Exception:
                 pass
-        event.accept()
+        self._cv_cap = None
+        # 清理显示引用
+        try:
+            if hasattr(self, '_display_label') and self._display_label:
+                self._display_label.clear()
+        except Exception:
+            pass
+        t = QTimer(self)
+        t.setSingleShot(True)
+        t.timeout.connect(self._async_cleanup_step4)
+        t.start(10)
+
+    def _async_cleanup_step4(self):
+        # 最后：销毁窗口（deleteLater 比 destroy/close 更安全）
+        try:
+            self.deleteLater()
+        except Exception:
+            try:
+                self.destroy()
+            except Exception:
+                pass
