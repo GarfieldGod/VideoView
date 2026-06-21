@@ -52,6 +52,9 @@ class VideoPlayerWindow(QMainWindow):
         self._cv_timer = None
         self._cv_fps = 30.0
 
+        # 追踪 pending single-shot timers，用于关闭时取消
+        self._pending_timers = []
+
         # VLC 后端
         self._vlc_inst = None
         self._vlc_player = None
@@ -66,14 +69,18 @@ class VideoPlayerWindow(QMainWindow):
 
         # 延迟加载放到 showEvent 中
         self._pending_load = (start_index,)
-        self.show()
+        self.showMaximized()
 
     def showEvent(self, event):
         super().showEvent(event)
         if hasattr(self, '_pending_load') and self._pending_load:
             idx = self._pending_load[0]
             del self._pending_load
-            QTimer.singleShot(50, lambda: self.load_video(idx))
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: self.load_video(idx))
+            self._pending_timers.append(timer)
+            timer.start(50)
 
     # ------------------------------------------------------------
     # 后端检测
@@ -95,7 +102,6 @@ class VideoPlayerWindow(QMainWindow):
     # ------------------------------------------------------------
     def setup_ui(self):
         self.setWindowTitle("视频播放器")
-        self.resize(1280, 820)
 
         central = QWidget()
         central.setStyleSheet("background-color:#000000;")
@@ -393,7 +399,11 @@ class VideoPlayerWindow(QMainWindow):
             self._is_playing = True
             self.btn_play.setText("暂停")
             self._vlc_timer.start(250)
-            QTimer.singleShot(150, self._apply_volume)
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._apply_volume)
+            self._pending_timers.append(timer)
+            timer.start(150)
 
         except Exception as e:
             print(f"[VideoPlayerWindow] VLC 加载失败，回退到 OpenCV: {e}")
@@ -476,7 +486,11 @@ class VideoPlayerWindow(QMainWindow):
                     total = int(self._cv_cap.get(cv2.CAP_PROP_FRAME_COUNT))
                     if total > 10 and cur >= total - 2:
                         self._cv_timer.stop()
-                        QTimer.singleShot(300, self.play_next)
+                        timer = QTimer(self)
+                        timer.setSingleShot(True)
+                        timer.timeout.connect(self.play_next)
+                        self._pending_timers.append(timer)
+                        timer.start(300)
                         return
                 except Exception:
                     pass
@@ -621,11 +635,19 @@ class VideoPlayerWindow(QMainWindow):
         if self._backend == 'vlc':
             self._load_vlc(abs_path)
             if cur_ms > 0:
-                QTimer.singleShot(400, lambda: self._seek_to(cur_ms))
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(lambda: self._seek_to(cur_ms))
+                self._pending_timers.append(timer)
+                timer.start(400)
         else:
             self._load_cv(abs_path)
             if cur_ms > 0:
-                QTimer.singleShot(200, lambda: self._seek_to(cur_ms))
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(lambda: self._seek_to(cur_ms))
+                self._pending_timers.append(timer)
+                timer.start(200)
 
         if was_playing:
             self._is_playing = True
@@ -663,6 +685,8 @@ class VideoPlayerWindow(QMainWindow):
 
     def _seek_to(self, target_ms):
         """统一跳转入口"""
+        if self._closed:
+            return
         target_ms = max(0, int(target_ms))
         if self._backend == 'vlc' and self._vlc_player:
             try:
@@ -799,6 +823,14 @@ class VideoPlayerWindow(QMainWindow):
         self._seek_to(target)
 
     def closeEvent(self, event):
+        # 先取消所有 pending timers，防止它们在窗口关闭后触发
+        for timer in self._pending_timers:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self._pending_timers.clear()
+
         self._closed = True
         if self._vlc_timer:
             self._vlc_timer.stop()

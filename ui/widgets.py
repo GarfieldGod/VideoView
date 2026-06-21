@@ -2,7 +2,7 @@
 
 import os
 
-from PyQt5.QtCore import Qt, QSize, QRect, QPoint, pyqtSignal
+from PyQt5.QtCore import Qt, QSize, QRect, QPoint, pyqtSignal, QTimer
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame,
     QListWidget, QListWidgetItem, QListView, QScrollArea, QStackedWidget,
@@ -103,14 +103,88 @@ class CollectionItem(QWidget):
     """收藏夹项组件 - 带右上角标记按钮"""
 
     def __init__(self, name, thumbnail_path, video_count,
-                 is_marked=False, parent=None, on_mark_changed=None):
+                 is_marked=False, parent=None, on_mark_changed=None,
+                 cache_manager=None, video_relative_path=None,
+                 on_thumbnail_ready=None):
         super().__init__(parent)
         self.name = name
         self.thumbnail_path = thumbnail_path
         self.video_count = video_count
         self.is_marked = is_marked
         self.on_mark_changed = on_mark_changed
+        self.cache_manager = cache_manager
+        self.video_relative_path = video_relative_path
+        self.on_thumbnail_ready = on_thumbnail_ready
+        self._thumbnail_loaded = False
         self.setup_ui()
+        # 不在初始化时加载缩略图：避免一次性为所有文件夹生成缩略图造成高负载
+        # 仅在用户点击时调用 load_thumbnail() 才开始加载
+
+    def load_thumbnail(self):
+        """加载缩略图：优先从缓存加载，否则触发异步生成（只执行一次）"""
+        if self._thumbnail_loaded:
+            return
+        self._thumbnail_loaded = True
+        if not self.cache_manager or not self.video_relative_path:
+            return
+
+        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path)
+        if exists:
+            self._set_thumbnail(cache_path)
+            return
+
+        # 触发异步生成（ThumbnailManager 会在生成完成后通过 update_from_cache 刷新）
+        if self.on_thumbnail_ready:
+            self.on_thumbnail_ready(self.video_relative_path)
+
+    def release_thumbnail(self):
+        """释放缩略图（滑出视口时调用，节省内存）"""
+        if not self._thumbnail_loaded:
+            return
+        self._thumbnail_loaded = False
+        # 清空 label 上的 pixmap：setText("📁") 并释放内存
+        try:
+            self.thumbnail_label.clear()
+            self.thumbnail_label.setText("📁")
+        except Exception:
+            pass
+
+    def is_thumbnail_loaded(self):
+        return self._thumbnail_loaded
+
+    def update_from_cache(self):
+        """从缓存刷新缩略图（ThumbnailManager 生成完成后调用）"""
+        # 只有已经加载过的项才更新；未加载项下次进入视口时再调用 load_thumbnail
+        if not self._thumbnail_loaded:
+            return
+        if not self.cache_manager or not self.video_relative_path:
+            return
+        exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path)
+        if exists:
+            self._set_thumbnail(cache_path)
+
+    def _set_thumbnail(self, cache_path):
+        """设置缩略图到 label"""
+        pixmap = QPixmap(cache_path)
+        if not pixmap.isNull():
+            scaled = pixmap.scaled(
+                THUMBNAIL_SIZE_COLLECTION[0],
+                THUMBNAIL_SIZE_COLLECTION[1],
+                Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            )
+            result = QPixmap(
+                THUMBNAIL_SIZE_COLLECTION[0],
+                THUMBNAIL_SIZE_COLLECTION[1],
+            )
+            result.fill(QColor('#2a2a44'))
+            painter = QPainter(result)
+            x = (THUMBNAIL_SIZE_COLLECTION[0] - scaled.width()) // 2
+            y = (THUMBNAIL_SIZE_COLLECTION[1] - scaled.height()) // 2
+            painter.drawPixmap(x, y, scaled)
+            painter.end()
+            self.thumbnail_label.setPixmap(result)
+        else:
+            self.thumbnail_label.setText("📁")
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -130,27 +204,8 @@ class CollectionItem(QWidget):
         )
         self.thumbnail_label.setAlignment(Qt.AlignCenter)
 
-        if self.thumbnail_path and os.path.exists(self.thumbnail_path):
-            pixmap = QPixmap(self.thumbnail_path)
-            if not pixmap.isNull():
-                scaled = pixmap.scaled(
-                    THUMBNAIL_SIZE_COLLECTION[0],
-                    THUMBNAIL_SIZE_COLLECTION[1],
-                    Qt.KeepAspectRatio, Qt.SmoothTransformation,
-                )
-                result = QPixmap(
-                    THUMBNAIL_SIZE_COLLECTION[0],
-                    THUMBNAIL_SIZE_COLLECTION[1],
-                )
-                result.fill(QColor('#2a2a44'))
-                painter = QPainter(result)
-                x = (THUMBNAIL_SIZE_COLLECTION[0] - scaled.width()) // 2
-                y = (THUMBNAIL_SIZE_COLLECTION[1] - scaled.height()) // 2
-                painter.drawPixmap(x, y, scaled)
-                painter.end()
-                self.thumbnail_label.setPixmap(result)
-        else:
-            self.thumbnail_label.setText("📁")
+        # 初始显示占位符
+        self.thumbnail_label.setText("📁")
 
         self.mark_btn = QPushButton(thumb_container)
         self.mark_btn.setFixedSize(40, 40)
@@ -171,11 +226,9 @@ class CollectionItem(QWidget):
         self.count_label.setStyleSheet("QLabel {color: #aaa; font-size: 16px;}")
         self.count_label.setAlignment(Qt.AlignCenter)
 
-        layout.addWidget(thumb_container)
-        layout.addWidget(self.name_label)
-        layout.addWidget(self.count_label)
-
-        self.setFixedWidth(280)
+        layout.addWidget(thumb_container, alignment=Qt.AlignCenter)
+        layout.addWidget(self.name_label, alignment=Qt.AlignCenter)
+        layout.addWidget(self.count_label, alignment=Qt.AlignCenter)
 
     def _update_mark_button_style(self):
         if self.is_marked:
@@ -224,12 +277,13 @@ class VideoItem(QWidget):
 
         self.thumbnail_width = THUMBNAIL_SIZE_VIDEO[0]
         self.thumbnail_height = THUMBNAIL_SIZE_VIDEO[1]
+        self._thumbnail_loaded = False
 
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
 
         self.setup_ui()
-        self.load_thumbnail()
+        # 不自动加载缩略图：交由 VideoGridWidget._update_viewport_items 管理
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -382,6 +436,10 @@ class VideoItem(QWidget):
         return QSize(THUMBNAIL_SIZE_VIDEO[0] + 20, self.thumbnail_height + 50)
 
     def load_thumbnail(self):
+        """加载缩略图：优先从缓存加载，否则触发异步生成（只执行一次）"""
+        if self._thumbnail_loaded:
+            return
+        self._thumbnail_loaded = True
         if not self.cache_manager:
             return
 
@@ -399,7 +457,24 @@ class VideoItem(QWidget):
         if self.on_thumbnail_ready:
             self.on_thumbnail_ready(self.video_path, self.video_relative_path, self)
 
+    def release_thumbnail(self):
+        """滑出视口时释放缩略图内存"""
+        if not self._thumbnail_loaded:
+            return
+        self._thumbnail_loaded = False
+        try:
+            self.thumbnail_label.clear()
+            self.thumbnail_label.setText("🎬")
+        except Exception:
+            pass
+
+    def is_thumbnail_loaded(self):
+        return self._thumbnail_loaded
+
     def update_from_cache(self):
+        """缩略图异步生成完成后回调——仅当该项仍在视口范围才刷新"""
+        if not self._thumbnail_loaded:
+            return
         if not self.cache_manager:
             return
         exists, cache_path = self.cache_manager.cache_exists(self.video_relative_path)
@@ -414,7 +489,7 @@ class VideoItem(QWidget):
 
 
 # ============================================================
-# 左侧收藏夹列表控件
+# 左侧收藏夹列表控件：视口范围内加载、范围外释放
 # ============================================================
 class CollectionListWidget(QListWidget):
     def __init__(self, parent=None):
@@ -429,12 +504,66 @@ class CollectionListWidget(QListWidget):
         self.setFlow(QListView.TopToBottom)
         self.setResizeMode(QListWidget.Fixed)
 
+        # 用 QTimer 去抖：滚动/调整大小后只做一次批量刷新
+        self._pending_refresh_timer = QTimer(self)
+        self._pending_refresh_timer.setSingleShot(True)
+        self._pending_refresh_timer.setInterval(80)
+        self._pending_refresh_timer.timeout.connect(self._update_viewport_items)
+
+        # 垂直滚动条、水平滚动条、尺寸变化都触发视口刷新
+        try:
+            self.verticalScrollBar().valueChanged.connect(
+                lambda _=None: self._pending_refresh_timer.start()
+            )
+            self.horizontalScrollBar().valueChanged.connect(
+                lambda _=None: self._pending_refresh_timer.start()
+            )
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._pending_refresh_timer.start()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._pending_refresh_timer.start()
+
+    def _update_viewport_items(self):
+        """仅加载视口内 + 周围 margin 范围内的缩略图，其余释放"""
+        if self.count() == 0:
+            return
+        try:
+            viewport_rect = self.viewport().rect()
+            # margin：上下各扩展一个 CollectionItem 大致高度，提前预加载
+            item_height = self.visualItemRect(self.item(0)).height() if self.count() > 0 else 400
+            margin = max(item_height * 1, 300)
+            expanded = viewport_rect.adjusted(0, -margin, 0, margin)
+
+            for i in range(self.count()):
+                item = self.item(i)
+                if item is None:
+                    continue
+                widget = self.itemWidget(item)
+                if widget is None or not hasattr(widget, 'load_thumbnail'):
+                    continue
+                item_rect = self.visualItemRect(item)
+                if item_rect.intersects(expanded):
+                    # 在视口范围内 → 加载（幂等）
+                    widget.load_thumbnail()
+                else:
+                    # 滑出视口（且超出 margin）→ 释放
+                    if hasattr(widget, 'release_thumbnail'):
+                        widget.release_thumbnail()
+        except Exception as e:
+            print(f"[CollectionListWidget] _update_viewport_items 异常: {e}")
+
 
 # ============================================================
-# 右侧视频网格控件
+# 右侧视频网格控件：视口范围内加载、范围外释放
 # ============================================================
 class VideoGridWidget(QWidget):
-    """视频网格组件 - 流式布局"""
+    """视频网格组件 - 流式布局 + 视口范围内按需加载缩略图"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -442,6 +571,72 @@ class VideoGridWidget(QWidget):
         self.on_favorite_changed_callback = None
         self.on_double_clicked_callback = None
         self.setup_ui()
+
+        # 视口刷新：滚动/尺寸变化后延迟合并刷新，避免高频率计算
+        self._pending_refresh_timer = QTimer(self)
+        self._pending_refresh_timer.setSingleShot(True)
+        self._pending_refresh_timer.setInterval(80)
+        self._pending_refresh_timer.timeout.connect(self._update_viewport_items)
+
+        # 连接滚动条信号
+        try:
+            self.scroll_area.verticalScrollBar().valueChanged.connect(
+                lambda _=None: self._pending_refresh_timer.start()
+            )
+            self.scroll_area.horizontalScrollBar().valueChanged.connect(
+                lambda _=None: self._pending_refresh_timer.start()
+            )
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._pending_refresh_timer.start()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._pending_refresh_timer.start()
+
+    def _update_viewport_items(self):
+        """根据当前视口加载可见项的缩略图，释放滑出视口的项"""
+        if not self.video_items:
+            return
+        try:
+            vp = self.scroll_area.viewport()
+            if vp is None:
+                return
+
+            # 以 content_widget 的坐标系构建可见 rect
+            x_offset = self.scroll_area.horizontalScrollBar().value()
+            y_offset = self.scroll_area.verticalScrollBar().value()
+            visible_rect = QRect(
+                int(x_offset),
+                int(y_offset),
+                vp.width(),
+                vp.height(),
+            )
+            # margin：提前预加载视口上下各约一个 VideoItem 高度的范围
+            margin_y = 500  # 约 ~560px 宽 * 16/9 的高度 + 标签
+            margin_x = 400
+            expanded = visible_rect.adjusted(-margin_x, -margin_y, margin_x, margin_y)
+
+            for key, item in list(self.video_items.items()):
+                if item is None or not hasattr(item, 'load_thumbnail'):
+                    continue
+                try:
+                    geom = item.geometry()
+                    if geom.width() == 0 and geom.height() == 0:
+                        # 还没布局完成 → 先不处理
+                        continue
+                    if geom.intersects(expanded):
+                        item.load_thumbnail()
+                    elif hasattr(item, 'release_thumbnail'):
+                        item.release_thumbnail()
+                except Exception:
+                    continue
+
+        except Exception as e:
+            print(f"[VideoGridWidget] _update_viewport_items 异常: {e}")
 
     def set_on_favorite_changed(self, callback):
         self.on_favorite_changed_callback = callback
@@ -516,3 +711,5 @@ class VideoGridWidget(QWidget):
         )
         self.video_items[video_relative_path] = video_item
         self.flow_layout.addWidget(video_item)
+        # 新增项后延迟刷新视口（布局完成后再决定是否加载缩略图）
+        self._pending_refresh_timer.start()

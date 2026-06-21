@@ -64,7 +64,7 @@ class MainWindow(QMainWindow):
 
         # 左侧面板
         self.left_panel = QFrame()
-        self.left_panel.setFixedWidth(320)
+        self.left_panel.setFixedWidth(400)
         self.left_panel.setFont(font)
         left_layout = QVBoxLayout(self.left_panel)
         left_layout.setContentsMargins(10, 10, 10, 10)
@@ -151,8 +151,17 @@ class MainWindow(QMainWindow):
         self.thumbnail_manager.finished.connect(self.on_thumbnail_ready)
         self.thumbnail_manager.start()
 
+        # 追踪 CollectionItem（按其缩略图对应的 video_relative_path）
+        self._collection_thumbnail_items = {}
+
     def on_thumbnail_ready(self, video_relative_path):
+        # 更新右侧视频网格中的 VideoItem
         self.right_panel.on_thumbnail_generated(video_relative_path)
+        # 更新左侧收藏夹列表中对应的 CollectionItem（如果有）
+        if video_relative_path in self._collection_thumbnail_items:
+            widget = self._collection_thumbnail_items[video_relative_path]
+            if widget:
+                widget.update_from_cache()
 
     def on_favorite_changed(self, video_relative_path, new_state):
         if self.cache_manager:
@@ -221,16 +230,15 @@ class MainWindow(QMainWindow):
         self.populate_collection_list()
         self.populate_fav_collection_list()
 
-        # 默认选中第一个
-        if self.collections:
-            self.collection_list.setCurrentRow(0)
-            self.on_collection_clicked(self.collection_list.item(0))
+        # 不默认选中第一个收藏夹，避免启动时为所有视频生成缩略图造成高负载
+        # 用户点击某个收藏夹时才开始加载该收藏夹的缩略图和视频
 
     # ------------------------------------------------------------
     # 填充列表
     # ------------------------------------------------------------
     def populate_collection_list(self):
         self.collection_list.clear()
+        self._collection_thumbnail_items.clear()
 
         # 按标记状态排序：未标记在前
         if self.cache_manager:
@@ -243,14 +251,11 @@ class MainWindow(QMainWindow):
             ordered = self.collections
 
         for collection in ordered:
-            thumbnail = None
+            video_rel = None
             if collection['videos'] and self.cache_manager:
                 try:
                     video_path = collection['videos'][0]
                     video_rel = os.path.relpath(video_path, self.root_folder).replace('\\', '/')
-                    exists, cache_path = self.cache_manager.cache_exists(video_rel)
-                    if exists:
-                        thumbnail = cache_path
                 except Exception:
                     pass
 
@@ -261,14 +266,37 @@ class MainWindow(QMainWindow):
             if self.cache_manager:
                 is_marked = self.cache_manager.is_marked(collection['name'])
 
+            # 构造缩略图请求回调
+            def make_thumb_callback(vp, vr):
+                return lambda _: self.thumbnail_manager.enqueue(vp, vr) if self.thumbnail_manager else None
+
+            thumb_callback = None
+            if collection['videos'] and self.cache_manager and video_rel:
+                try:
+                    video_path = collection['videos'][0]
+                    thumb_callback = make_thumb_callback(video_path, video_rel)
+                except Exception:
+                    pass
+
             widget = CollectionItem(
                 collection['name'],
-                thumbnail,
+                None,  # thumbnail_path 由 load_thumbnail 从缓存加载
                 len(collection['videos']),
                 is_marked=is_marked,
                 on_mark_changed=self.on_collection_mark_changed,
+                cache_manager=self.cache_manager,
+                video_relative_path=video_rel,
+                on_thumbnail_ready=thumb_callback,
             )
             self.collection_list.setItemWidget(item, widget)
+
+            # 注册到映射中，以便缩略图生成完成后能定位到正确的 CollectionItem
+            if video_rel:
+                self._collection_thumbnail_items[video_rel] = widget
+
+        # 所有项已添加 → 触发一次视口刷新，加载当前可见项的缩略图
+        if hasattr(self.collection_list, '_pending_refresh_timer'):
+            self.collection_list._pending_refresh_timer.start()
 
     def refresh_fav_collection_list(self):
         current_row = self.fav_collection_list.currentRow()
@@ -281,29 +309,44 @@ class MainWindow(QMainWindow):
         if not self.cache_manager:
             return
 
-        # 默认收藏夹：使用收藏的第一个视频作为缩略图
+        # 默认收藏夹：使用收藏的第一个视频作为缩略图（延迟加载）
         fav_videos = self.cache_manager.get_favorite_videos()
-        thumbnail = None
+        video_rel = None
         if fav_videos:
             try:
                 first_video = fav_videos[0]
-                rel_path = os.path.relpath(first_video, self.root_folder).replace('\\', '/')
-                exists, cache_path = self.cache_manager.cache_exists(rel_path)
-                if exists:
-                    thumbnail = cache_path
+                video_rel = os.path.relpath(
+                    first_video, self.root_folder
+                ).replace('\\', '/')
             except Exception:
                 pass
 
         from PyQt5.QtCore import QSize
         item = QListWidgetItem(self.fav_collection_list)
         item.setSizeHint(QSize(280, 420))
+
+        # 构造缩略图请求回调
+        def make_fav_thumb_callback():
+            if video_rel and fav_videos:
+                return lambda _: self.thumbnail_manager.enqueue(
+                    fav_videos[0], video_rel
+                ) if self.thumbnail_manager else None
+            return None
+
         widget = CollectionItem(
             "默认收藏夹",
-            thumbnail,
+            None,
             self.cache_manager.get_favorite_count(),
             is_marked=False,
+            cache_manager=self.cache_manager,
+            video_relative_path=video_rel,
+            on_thumbnail_ready=make_fav_thumb_callback(),
         )
         self.fav_collection_list.setItemWidget(item, widget)
+        if video_rel:
+            self._collection_thumbnail_items[video_rel] = widget
+        if hasattr(self.fav_collection_list, '_pending_refresh_timer'):
+            self.fav_collection_list._pending_refresh_timer.start()
 
     # ------------------------------------------------------------
     # 切换
@@ -351,6 +394,9 @@ class MainWindow(QMainWindow):
         widget = self.collection_list.itemWidget(item)
         target_name = widget.name if widget else None
         if target_name is not None:
+            # 点击时才开始加载该收藏夹的缩略图（延迟加载，避免高负载）
+            if widget is not None:
+                widget.load_thumbnail()
             for c in self.collections:
                 if c['name'] == target_name:
                     self.show_videos(c)
@@ -358,6 +404,9 @@ class MainWindow(QMainWindow):
 
     def on_fav_collection_clicked(self, item):
         self.current_tab = 1
+        widget = self.fav_collection_list.itemWidget(item)
+        if widget is not None:
+            widget.load_thumbnail()
         self.show_default_favorites()
 
     def show_videos(self, collection):
