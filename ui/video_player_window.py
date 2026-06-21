@@ -32,6 +32,7 @@ class VideoPlayerWindow(QMainWindow):
     def __init__(self, video_paths, start_index=0, cache_manager=None,
                  parent=None, root_folder=None, on_video_rotated=None,
                  collection_name=None,
+                 collection_source=None,
                  on_get_next_collection_videos=None,
                  on_get_prev_collection_videos=None):
         super().__init__(parent)
@@ -44,6 +45,7 @@ class VideoPlayerWindow(QMainWindow):
         self.root_folder = root_folder.replace('\\', '/') if root_folder else None
         self._on_video_rotated_cb = on_video_rotated  # 旋转后通知主窗口刷新缩略图
         self._collection_name = collection_name  # 当前播放的收藏夹名
+        self._collection_source = collection_source  # 来源：0=根目录，1=最爱列表
         # 跨收藏集导航回调：签名 on_get_next_collection_videos() -> (video_list, collection_name) 或 None
         self._on_get_next_collection_videos = on_get_next_collection_videos
         self._on_get_prev_collection_videos = on_get_prev_collection_videos
@@ -468,7 +470,8 @@ class VideoPlayerWindow(QMainWindow):
             if self.cache_manager is not None:
                 # 通过 cache_manager 的便捷接口写入
                 self.cache_manager.set_last_played(
-                    rel_path, abs_path, self._collection_name
+                    rel_path, abs_path, self._collection_name,
+                    source_mode=self._collection_source,
                 )
         except Exception as e:
             try:

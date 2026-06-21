@@ -703,7 +703,13 @@ class MainWindow(QMainWindow):
             print(f"自动打开第一个收藏夹失败: {e}")
 
     def _auto_open_last_played_or_first(self):
-        """优先打开「上次播放位置」所在的收藏夹，否则打开第一个收藏夹。"""
+        """打开「上次播放位置」所在的收藏集。
+
+        关键：按 last_played.source_mode 精确判断来源。
+        - source_mode == 0 → 从根目录打开的视频 → 定位到根目录下的收藏集
+        - source_mode == 1 → 从最爱列表打开的视频 → 定位到最爱列表下的收藏集
+        - source_mode 缺失 → 兼容旧数据：先看 collection_name 在哪个列表里，找不到则按路径匹配
+        """
         try:
             if self.cache_manager is None:
                 self._auto_open_first_collection(0)
@@ -714,66 +720,108 @@ class MainWindow(QMainWindow):
                 return
             last_rel = str(last['rel_path']).replace('\\', '/')
             last_coll = last.get('collection_name')
+            source_mode = last.get('source_mode')
 
-            # 优先按 collection_name 匹配（无论是根目录还是批量收藏的命名）
-            if last_coll:
-                # 先尝试在根目录的 collections 中匹配
+            fav_names = self._get_fav_names_ordered()
+
+            # ---- 1) source_mode == 0：用户从根目录打开的视频 ----
+            if source_mode == 0:
+                # 优先按 collection_name 匹配
+                if last_coll:
+                    for idx, c in enumerate(self.collections):
+                        if c['name'] == last_coll:
+                            self._select_root_and_open(idx, c)
+                            return
+                # 兜底：按视频路径在根目录收藏集内匹配
                 for idx, c in enumerate(self.collections):
-                    if c['name'] == last_coll:
-                        # 选中 + 打开
+                    for vp in c.get('videos', []):
                         try:
-                            if 0 <= idx < self.collection_list.count():
-                                item = self.collection_list.item(idx)
-                                if item:
-                                    self.collection_list.setCurrentItem(item)
-                                    widget = self.collection_list.itemWidget(item)
-                                    if widget and hasattr(widget, 'load_thumbnail'):
-                                        widget.load_thumbnail()
+                            rp = os.path.relpath(vp, self.root_folder).replace('\\', '/')
+                            if rp == last_rel:
+                                self._select_root_and_open(idx, c)
+                                return
                         except Exception:
-                            pass
-                        self.show_videos(c)
-                        return
-                # 再尝试在最爱列表中匹配
+                            continue
+                # 还是找不到：按根目录第一个
+                self._auto_open_first_collection(0)
+                return
+
+            # ---- 2) source_mode == 1：用户从最爱列表打开的视频 ----
+            if source_mode == 1:
+                # 优先按 collection_name 匹配（可能是"默认收藏夹"或命名收藏夹）
+                if last_coll and last_coll in fav_names:
+                    self._switch_to_fav_and_open(last_coll, fav_names)
+                    return
+                # 兜底：按视频路径在最爱收藏集内匹配（含默认收藏夹）
                 try:
-                    fav_names = self._get_fav_names_ordered()
-                    if last_coll in fav_names:
-                        idx = fav_names.index(last_coll)
-                        try:
-                            if 0 <= idx < self.fav_collection_list.count():
-                                item = self.fav_collection_list.item(idx)
-                                if item:
-                                    self.fav_collection_list.setCurrentItem(item)
-                                    widget = self.fav_collection_list.itemWidget(item)
-                                    if widget and hasattr(widget, 'load_thumbnail'):
-                                        widget.load_thumbnail()
-                        except Exception:
-                            pass
-                        if last_coll == '默认收藏夹':
-                            self.show_default_favorites()
+                    matched = None
+                    for name in fav_names:
+                        if name == '默认收藏夹':
+                            fvs = self.cache_manager.get_favorite_videos()
                         else:
-                            self.show_named_collection(last_coll)
+                            fvs = self.cache_manager.get_named_collection_videos(name)
+                        for v in fvs:
+                            try:
+                                r = os.path.relpath(v, self.root_folder).replace('\\', '/')
+                                if r == last_rel:
+                                    matched = name
+                                    break
+                            except Exception:
+                                continue
+                        if matched is not None:
+                            break
+                    if matched is not None:
+                        self._switch_to_fav_and_open(matched, fav_names)
                         return
                 except Exception:
                     pass
+                # 还是找不到：按最爱列表第一个
+                self._auto_open_first_collection(1)
+                return
 
-            # 兜底：按 last_rel 路径匹配某个 collection
+            # ---- 3) source_mode 缺失：兼容旧配置（既可能是根目录也可能是最爱） ----
+            # 3a) 先看 collection_name 在哪个列表里（如果在两个列表里都出现，优先用旧逻辑：根目录）
+            if last_coll:
+                for idx, c in enumerate(self.collections):
+                    if c['name'] == last_coll:
+                        self._select_root_and_open(idx, c)
+                        return
+                if last_coll in fav_names:
+                    self._switch_to_fav_and_open(last_coll, fav_names)
+                    return
+            # 3b) 按视频路径在两个列表里兜底匹配（先根目录、再最爱）
             for idx, c in enumerate(self.collections):
                 for vp in c.get('videos', []):
                     try:
                         rp = os.path.relpath(vp, self.root_folder).replace('\\', '/')
                         if rp == last_rel:
-                            try:
-                                if 0 <= idx < self.collection_list.count():
-                                    item = self.collection_list.item(idx)
-                                    if item:
-                                        self.collection_list.setCurrentItem(item)
-                            except Exception:
-                                pass
-                            self.show_videos(c)
+                            self._select_root_and_open(idx, c)
                             return
                     except Exception:
                         continue
-            # 没有找到匹配的收藏夹，退化到打开第一个
+            try:
+                matched = None
+                for name in fav_names:
+                    if name == '默认收藏夹':
+                        fvs = self.cache_manager.get_favorite_videos()
+                    else:
+                        fvs = self.cache_manager.get_named_collection_videos(name)
+                    for v in fvs:
+                        try:
+                            r = os.path.relpath(v, self.root_folder).replace('\\', '/')
+                            if r == last_rel:
+                                matched = name
+                                break
+                        except Exception:
+                            continue
+                    if matched is not None:
+                        break
+                if matched is not None:
+                    self._switch_to_fav_and_open(matched, fav_names)
+                    return
+            except Exception:
+                pass
+            # 最终兜底：打开第一个（根目录第一个）
             self._auto_open_first_collection(0)
         except Exception as e:
             print(f"[MainWindow] _auto_open_last_played_or_first 异常: {e}")
@@ -781,6 +829,50 @@ class MainWindow(QMainWindow):
                 self._auto_open_first_collection(0)
             except Exception:
                 pass
+
+    def _switch_to_fav_and_open(self, name, fav_names):
+        """切换左侧面板到「最爱」，选中指定项，右侧打开对应收藏集。"""
+        try:
+            self._update_switch_buttons(1)
+            self.list_stack.setCurrentIndex(1)
+            self.current_tab = 1
+            try:
+                idx = fav_names.index(name)
+                if 0 <= idx < self.fav_collection_list.count():
+                    item = self.fav_collection_list.item(idx)
+                    if item:
+                        self.fav_collection_list.setCurrentItem(item)
+                        widget = self.fav_collection_list.itemWidget(item)
+                        if widget and hasattr(widget, 'load_thumbnail'):
+                            widget.load_thumbnail()
+            except Exception:
+                pass
+            if name == '默认收藏夹':
+                self.show_default_favorites()
+            else:
+                self.show_named_collection(name)
+        except Exception as e:
+            print(f"[MainWindow] _switch_to_fav_and_open 异常: {e}")
+
+    def _select_root_and_open(self, idx, collection):
+        """选中左侧根目录列表的指定项，右侧打开对应收藏集。"""
+        try:
+            self._update_switch_buttons(0)
+            self.list_stack.setCurrentIndex(0)
+            self.current_tab = 0
+            try:
+                if 0 <= idx < self.collection_list.count():
+                    item = self.collection_list.item(idx)
+                    if item:
+                        self.collection_list.setCurrentItem(item)
+                        widget = self.collection_list.itemWidget(item)
+                        if widget and hasattr(widget, 'load_thumbnail'):
+                            widget.load_thumbnail()
+            except Exception:
+                pass
+            self.show_videos(collection)
+        except Exception as e:
+            print(f"[MainWindow] _select_root_and_open 异常: {e}")
 
     def on_collection_clicked(self, item):
         self.current_tab = 0
@@ -1085,6 +1177,7 @@ class MainWindow(QMainWindow):
                 parent=self, root_folder=self.root_folder,
                 on_video_rotated=self.on_video_rotated,
                 collection_name=current_collection_name,
+                collection_source=self.current_tab,
                 on_get_next_collection_videos=self._on_player_next_collection,
                 on_get_prev_collection_videos=self._on_player_prev_collection,
             )

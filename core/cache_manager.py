@@ -411,13 +411,14 @@ class CacheManager:
             print(f"[CacheManager] 保存根目录配置失败: {e}")
 
     def set_last_played(self, video_relative_path, video_abs_path=None,
-                         collection_name=None):
+                         collection_name=None, source_mode=None):
         """记录最近一次播放的视频信息。
 
         Args:
             video_relative_path: 相对 root_folder 的相对路径（如 "A/B/x.mp4"）
             video_abs_path: 可选，绝对路径（冗余记录，便于调试）
             collection_name: 可选，所在的收藏夹名
+            source_mode: 可选，来源模式，0=根目录收藏夹，1=最爱列表
         """
         try:
             from datetime import datetime, timezone
@@ -431,6 +432,8 @@ class CacheManager:
             last['abs_path'] = video_abs_path.replace('\\', '/')
         if collection_name:
             last['collection_name'] = collection_name
+        if source_mode is not None:
+            last['source_mode'] = int(source_mode)
         last['time'] = now_iso
 
         self.config['last_played'] = last
