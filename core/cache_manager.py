@@ -1,10 +1,11 @@
 """基于 JSON 的缓存管理器
 
 负责：
-- 缩略图缓存清单 (cache_manifest.json)
-- 收藏夹列表 (favorites.json)
-- 标记的收藏夹 (marked_collections.json)
-- 视频旋转角度 (rotations.json)
+- 缩略图缓存清单 (.videoview/cache_manifest.json)
+- 收藏夹列表 (.videoview/favorites.json)
+- 标记的收藏夹 (.videoview/marked_collections.json)
+- 视频旋转角度 (.videoview/rotations.json)
+（音量持久化见 app_config.json）
 """
 
 import os
@@ -22,11 +23,16 @@ class CacheManager:
         self.cache_dir = cache_dir
         self.root_folder = root_folder.replace('\\', '/')
         self.manifest_path = os.path.join(cache_dir, 'cache_manifest.json')
-        self.favorites_path = os.path.join(cache_dir, 'favorites.json')
+        # favorites.json 放在 .videoview 根目录（与 rotations.json、marked_collections.json 同级）
+        self.favorites_path = os.path.join(os.path.dirname(cache_dir), 'favorites.json')
         self.manifest = self._load_manifest()
         self.favorites = self._load_favorites()
         self.marked_collections = self._load_marked_collections()
         self.rotations = self._load_rotations()
+
+    # ------------------------------------------------------------
+    # 缓存清单
+    # ------------------------------------------------------------
 
     def _load_manifest(self):
         if os.path.exists(self.manifest_path):

@@ -9,7 +9,7 @@
 import os
 import cv2
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QEvent
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QStackedLayout,
@@ -38,6 +38,9 @@ class VideoPlayerWindow(QMainWindow):
         self._current_ms = 0
         self._rotation = 0
         self._is_playing = False
+        self._slider_seeking = False
+        self._muted = False
+        self._closed = False  # 窗口关闭标志，防止定时器在析构后触发
 
         # OpenCV 后端
         self._cv_cap = None
@@ -52,6 +55,9 @@ class VideoPlayerWindow(QMainWindow):
 
         # 必须先检测后端，再构建 UI（setup_ui 依赖 self._backend）
         self._detect_backend()
+        # 音量从 app_config.json 读取（持久化），无 config 时默认 80
+        from core import get_volume
+        self._volume = get_volume()
         self.setup_ui()
 
         # 延迟加载放到 showEvent 中，此时窗口已渲染完毕，winId() 有效
@@ -139,6 +145,8 @@ class VideoPlayerWindow(QMainWindow):
         self.progress_slider.sliderPressed.connect(self._on_slider_pressed)
         self.progress_slider.sliderReleased.connect(self._on_slider_released)
         self.progress_slider.sliderMoved.connect(self._on_slider_moved)
+        # 安装事件过滤器：点击进度条任意位置直接跳转
+        self.progress_slider.installEventFilter(self)
         self.time_total = QLabel("00:00")
         self.time_total.setStyleSheet("color:#bbb; font-size:13px;")
         time_row.addWidget(self.time_current)
@@ -159,6 +167,30 @@ class VideoPlayerWindow(QMainWindow):
         self.btn_rot_right.clicked.connect(lambda: self.rotate_video(90))
         self.btn_fav = self._make_btn("收藏")
         self.btn_fav.clicked.connect(self.toggle_favorite)
+
+        # 音量控制
+        self.btn_vol_down = self._make_btn("🔉")
+        self.btn_vol_down.setFixedWidth(38)
+        self.btn_vol_down.clicked.connect(lambda: self._change_volume(-10))
+        self.btn_mute = self._make_btn("🔊")
+        self.btn_mute.setFixedWidth(38)
+        self.btn_mute.clicked.connect(self._toggle_mute)
+        self.btn_vol_up = self._make_btn("🔊+")
+        self.btn_vol_up.setFixedWidth(38)
+        self.btn_vol_up.clicked.connect(lambda: self._change_volume(10))
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(self._volume)
+        self.volume_slider.setFixedWidth(100)
+        self.volume_slider.setStyleSheet(
+            "QSlider::groove:horizontal{background:#2a2a3e;height:6px;border-radius:3px;}"
+            "QSlider::handle:horizontal{background:#7a7a9e;width:14px;margin:-5px 0;border-radius:7px;}"
+            "QSlider::handle:horizontal:hover{background:#aaaac0;}"
+        )
+        self.volume_slider.valueChanged.connect(self._on_volume_changed)
+        self.volume_label = QLabel(str(self._volume))
+        self.volume_label.setStyleSheet("color:#bbb;font-size:13px;min-width:28px;")
+
         self.filename_label = QLabel("")
         self.filename_label.setStyleSheet("color:#ddd; font-size:13px; padding:0 8px;")
         self.filename_label.setAlignment(Qt.AlignCenter)
@@ -168,6 +200,11 @@ class VideoPlayerWindow(QMainWindow):
         btn_row.addWidget(self.btn_rot_left)
         btn_row.addWidget(self.btn_rot_right)
         btn_row.addWidget(self.btn_fav)
+        btn_row.addWidget(self.btn_vol_down)
+        btn_row.addWidget(self.btn_mute)
+        btn_row.addWidget(self.btn_vol_up)
+        btn_row.addWidget(self.volume_slider, 0)
+        btn_row.addWidget(self.volume_label)
         btn_row.addWidget(self.filename_label, 1)
 
         ctrl_layout.addLayout(time_row)
@@ -185,6 +222,104 @@ class VideoPlayerWindow(QMainWindow):
             "QPushButton:pressed{background-color:#2a2a4a;}"
         )
         return btn
+
+    def eventFilter(self, obj, event):
+        """事件过滤器：让进度条支持点击任意位置跳转"""
+        if obj is self.progress_slider:
+            etype = event.type()
+            if etype == QEvent.MouseButtonPress:
+                # 根据鼠标点击位置计算目标毫秒值，并立即跳转
+                btn = event.button()
+                if btn == Qt.LeftButton:
+                    try:
+                        pos_x = event.pos().x()
+                        w = self.progress_slider.width()
+                        if w > 0:
+                            mn = self.progress_slider.minimum()
+                            mx = self.progress_slider.maximum()
+                            ratio = max(0.0, min(1.0, pos_x / w))
+                            target = int(mn + (mx - mn) * ratio)
+                            self.progress_slider.setValue(target)
+                            self._slider_seeking = True
+                            self._seek_to(target)
+                            return True  # 消费事件，阻止默认 pageStep 行为
+                    except Exception:
+                        pass
+            elif etype == QEvent.MouseButtonRelease:
+                self._slider_seeking = False
+                return True
+        return super().eventFilter(obj, event)
+
+    def _seek_to(self, target_ms):
+        """统一跳转入口：同时更新 VLC 或 OpenCV 播放位置"""
+        target_ms = max(0, int(target_ms))
+        if self._backend == 'vlc' and self._vlc_player:
+            try:
+                self._vlc_player.set_time(target_ms)
+            except Exception:
+                pass
+        elif self._cv_cap is not None:
+            try:
+                self._cv_cap.set(cv2.CAP_PROP_POS_MSEC, float(target_ms))
+            except Exception:
+                pass
+        try:
+            self._current_ms = target_ms
+            self.time_current.setText(self._format_ms(target_ms))
+        except Exception:
+            pass
+
+    def _apply_volume(self):
+        """把 self._volume 应用到 VLC 播放器并持久化"""
+        vol = 0 if self._muted else max(0, min(100, int(self._volume)))
+        try:
+            self.volume_slider.blockSignals(True)
+            self.volume_slider.setValue(vol if not self._muted else 0)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.volume_slider.blockSignals(False)
+            except Exception:
+                pass
+        try:
+            self.volume_label.setText(str(vol))
+        except Exception:
+            pass
+        if self._backend == 'vlc' and self._vlc_player is not None:
+            try:
+                self._vlc_player.audio_set_volume(vol)
+            except Exception:
+                pass
+        # 持久化到 app_config.json
+        from core import save_volume
+        save_volume(vol if not self._muted else self._volume)
+
+    def _on_volume_changed(self, value):
+        self._volume = max(0, min(100, int(value)))
+        self._muted = False
+        try:
+            self.btn_mute.setText("🔊")
+        except Exception:
+            pass
+        self._apply_volume()
+
+    def _change_volume(self, delta):
+        self._muted = False
+        self._volume = max(0, min(100, int(self._volume) + int(delta)))
+        try:
+            self.btn_mute.setText("🔊")
+        except Exception:
+            pass
+        self._apply_volume()
+
+    def _toggle_mute(self):
+        self._muted = not self._muted
+        try:
+            self.btn_mute.setText("🔇" if self._muted else "🔊")
+        except Exception:
+            pass
+        self._apply_volume()
 
     # ------------------------------------------------------------
     # VLC 后端
@@ -236,12 +371,14 @@ class VideoPlayerWindow(QMainWindow):
 
     def _on_vlc_tick(self):
         """每 250ms 更新 VLC 进度条；检测播放错误并降级 OpenCV"""
-        if self._vlc_player is None:
+        if self._vlc_player is None or self._closed:
             return
         try:
             state = self._vlc_player.get_state()
             # VLC 状态：0=NothingSpecial, 1=Opening, 2=Buffering, 3=Playing, 4=Paused, 5=Stopped, 6=Ended, 7=Error
             if state == 7:  # Error — 降级到 OpenCV
+                if self._closed:
+                    return
                 print("[VideoPlayerWindow] VLC 播放错误，降级到 OpenCV")
                 self._vlc_timer.stop()
                 try:
@@ -255,6 +392,8 @@ class VideoPlayerWindow(QMainWindow):
                 return
 
             if state in (3, 4):  # Playing or Paused
+                if self._closed:
+                    return
                 total = self._vlc_player.get_length()
                 cur = self._vlc_player.get_time()
                 self._total_ms = max(1, total)
@@ -262,9 +401,13 @@ class VideoPlayerWindow(QMainWindow):
                 if total > 0:
                     try:
                         self.progress_slider.setRange(0, max(1, total))
-                        self.progress_slider.setValue(max(0, int(cur)))
                     except Exception:
                         pass
+                    if not self._slider_seeking:  # 用户操作时不被定时器覆盖
+                        try:
+                            self.progress_slider.setValue(max(0, int(cur)))
+                        except Exception:
+                            pass
                     self.time_current.setText(self._format_ms(cur))
                     self.time_total.setText(self._format_ms(total))
         except Exception:
@@ -302,6 +445,8 @@ class VideoPlayerWindow(QMainWindow):
 
     def _load_vlc(self, abs_path):
         """VLC 加载：关键时序——原生窗口 → 绑定 HWND → 创建媒体(含滤镜) → set_media → play()"""
+        if self._closed:
+            return
         try:
             if self._vlc_player is None:
                 self._load_cv(abs_path)
@@ -337,6 +482,8 @@ class VideoPlayerWindow(QMainWindow):
             print(f"[VideoPlayerWindow] VLC play() = {ret}")
             self._is_playing = True
             self.btn_play.setText("暂停")
+            # 应用音量（VLC 需要在 play() 之后设置音量才生效）
+            QTimer.singleShot(150, self._apply_volume)
 
         except Exception as e:
             print(f"[VideoPlayerWindow] VLC 加载失败，回退到 OpenCV: {e}")
@@ -345,6 +492,8 @@ class VideoPlayerWindow(QMainWindow):
 
     def _load_cv(self, abs_path):
         """OpenCV 逐帧播放（VLC 不可用时的回退）"""
+        if self._closed:
+            return
         try:
             if self._vlc_timer:
                 self._vlc_timer.stop()
@@ -412,7 +561,7 @@ class VideoPlayerWindow(QMainWindow):
             self._display_label.setText("加载失败")
 
     def _on_cv_tick(self):
-        if self._cv_cap is None or not self._is_playing:
+        if self._cv_cap is None or not self._is_playing or self._closed:
             return
         try:
             ret, frame = self._cv_cap.read()
@@ -438,10 +587,11 @@ class VideoPlayerWindow(QMainWindow):
                 if pos_ms < 0:
                     pos_ms = 0
                 self._current_ms = pos_ms
-                try:
-                    self.progress_slider.setValue(pos_ms)
-                except Exception:
-                    pass
+                if not self._slider_seeking:
+                    try:
+                        self.progress_slider.setValue(pos_ms)
+                    except Exception:
+                        pass
                 self.time_current.setText(self._format_ms(pos_ms))
             except Exception:
                 pass
@@ -570,20 +720,12 @@ class VideoPlayerWindow(QMainWindow):
             )
 
     def _on_slider_pressed(self):
-        pass
+        self._slider_seeking = True
 
     def _on_slider_released(self):
+        self._slider_seeking = False
         target_ms = int(self.progress_slider.value())
-        if self._backend == 'vlc' and self._vlc_player:
-            try:
-                self._vlc_player.set_time(max(0, target_ms))
-            except Exception:
-                pass
-        elif self._cv_cap:
-            try:
-                self._cv_cap.set(cv2.CAP_PROP_POS_MSEC, float(max(0, target_ms)))
-            except Exception:
-                pass
+        self._seek_to(target_ms)
 
     def _on_slider_moved(self, position):
         self.time_current.setText(self._format_ms(position))
@@ -609,6 +751,18 @@ class VideoPlayerWindow(QMainWindow):
                 self._seek_relative(-5000)
             elif key == Qt.Key_Right:
                 self._seek_relative(5000)
+            elif key == Qt.Key_Up:
+                self._change_volume(5)
+                event.accept()
+                return
+            elif key == Qt.Key_Down:
+                self._change_volume(-5)
+                event.accept()
+                return
+            elif key == Qt.Key_M:
+                self._toggle_mute()
+                event.accept()
+                return
             elif key == Qt.Key_N:
                 self.play_next()
             elif key == Qt.Key_P:
@@ -626,33 +780,28 @@ class VideoPlayerWindow(QMainWindow):
 
     def _seek_relative(self, delta_ms):
         target = max(0, min(self._total_ms, self._current_ms + delta_ms))
-        if self._backend == 'vlc' and self._vlc_player:
-            try:
-                self._vlc_player.set_time(max(0, target))
-            except Exception:
-                pass
-        elif self._cv_cap:
-            try:
-                self._cv_cap.set(cv2.CAP_PROP_POS_MSEC, float(target))
-            except Exception:
-                pass
-
-    def closeEvent(self, event):
         try:
-            if self._vlc_timer:
-                self._vlc_timer.stop()
-            if self._vlc_player:
-                try:
-                    self._vlc_player.stop()
-                except Exception:
-                    pass
-            if self._cv_timer:
-                self._cv_timer.stop()
-            if self._cv_cap:
-                try:
-                    self._cv_cap.release()
-                except Exception:
-                    pass
+            self.progress_slider.setValue(int(target))
         except Exception:
             pass
+        self._seek_to(target)
+
+    def closeEvent(self, event):
+        self._closed = True
+        # 先停定时器（阻止所有后续 tick）
+        if self._vlc_timer:
+            self._vlc_timer.stop()
+        if self._cv_timer:
+            self._cv_timer.stop()
+        # 再停止播放
+        if self._vlc_player:
+            try:
+                self._vlc_player.stop()
+            except Exception:
+                pass
+        if self._cv_cap:
+            try:
+                self._cv_cap.release()
+            except Exception:
+                pass
         event.accept()

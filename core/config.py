@@ -1,4 +1,4 @@
-"""应用配置：保存 / 读取上次打开的根目录"""
+"""应用配置：保存 / 读取上次打开的根目录、音量等设置"""
 
 import os
 import json
@@ -36,3 +36,14 @@ def set_last_root_folder(folder):
     config = get_app_config()
     config['last_root_folder'] = folder
     save_app_config(config)
+
+
+def get_volume():
+    return max(0, min(100, int(get_app_config().get('volume', 80))))
+
+
+def save_volume(volume):
+    config = get_app_config()
+    config['volume'] = max(0, min(100, int(volume)))
+    save_app_config(config)
+

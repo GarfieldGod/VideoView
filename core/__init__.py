@@ -26,6 +26,8 @@ from .config import (
     save_app_config,
     get_last_root_folder,
     set_last_root_folder,
+    get_volume,
+    save_volume,
 )
 
 __all__ = [
@@ -50,4 +52,6 @@ __all__ = [
     "save_app_config",
     "get_last_root_folder",
     "set_last_root_folder",
+    "get_volume",
+    "save_volume",
 ]
