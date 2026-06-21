@@ -1,0 +1,48 @@
+# Python 虚拟环境
+.venv/
+venv/
+env/
+
+# Python 编译产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+
+# IDE 配置
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# 应用缓存与用户数据
+.videoview/
+app_config.json
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# VLC 运行时（体积较大，由用户自行下载或脚本生成）
+vlc/
+
+# 临时文件
+*.bak
+*.tmp
+*.swp
+*~
+
+# 系统文件（Windows）
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# 系统文件（macOS）
+.DS_Store
+._*
+
+# 系统文件（Linux）
+*~
