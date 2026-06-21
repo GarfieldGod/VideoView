@@ -15,6 +15,10 @@ from .utils import (
     path_hash,
     pixmap_to_bytes,
     bytes_to_pixmap,
+    has_vlc,
+    get_vlc_module,
+    get_vlc_instance,
+    get_vlc_dir,
 )
 from .config import (
     APP_CONFIG_PATH,
@@ -37,6 +41,10 @@ __all__ = [
     "path_hash",
     "pixmap_to_bytes",
     "bytes_to_pixmap",
+    "has_vlc",
+    "get_vlc_module",
+    "get_vlc_instance",
+    "get_vlc_dir",
     "APP_CONFIG_PATH",
     "get_app_config",
     "save_app_config",

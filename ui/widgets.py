@@ -313,15 +313,21 @@ class VideoItem(QWidget):
         try:
             menu = QMenu(self)
 
-            action_internal = QAction("在应用内播放（上一个/下一个/收藏/旋转）", self)
+            action_internal = QAction("播放", self)
             action_internal.triggered.connect(
                 lambda: self.on_double_clicked(self.video_path, self.video_relative_path)
             )
             menu.addAction(action_internal)
 
-            action_external = QAction("以本地播放器打开（流畅 + 有声音）", self)
+            action_external = QAction("以本地播放器打开", self)
             action_external.triggered.connect(lambda: self._open_with_system_player())
             menu.addAction(action_external)
+
+            menu.addSeparator()
+
+            action_explorer = QAction("在资源管理器中浏览", self)
+            action_explorer.triggered.connect(lambda: self._open_in_explorer())
+            menu.addAction(action_explorer)
 
             menu.exec_(self.mapToGlobal(pos))
         except Exception as e:
@@ -358,6 +364,19 @@ class VideoItem(QWidget):
                     os.startfile(abs_path)
             except Exception as e2:
                 print(f"[VideoItem] 系统打开也失败: {e2}")
+
+    def _open_in_explorer(self):
+        """在资源管理器中打开所在目录并选中该文件"""
+        try:
+            abs_path = os.path.abspath(self.video_path)
+            folder = os.path.dirname(abs_path)
+            if os.name == 'nt':
+                import subprocess
+                subprocess.Popen(f'explorer /select,"{abs_path}"', close_fds=True)
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        except Exception as e:
+            print(f"[VideoItem] 资源管理器打开失败: {e}")
 
     def sizeHint(self):
         return QSize(THUMBNAIL_SIZE_VIDEO[0] + 20, self.thumbnail_height + 50)

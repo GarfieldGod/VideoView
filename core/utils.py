@@ -1,11 +1,103 @@
-"""缩略图生成线程池管理器 + 通用工具函数"""
+"""VLC 依赖检测 / 缩略图线程池 / 通用工具"""
 
 import os
+import sys
 import threading
 from queue import Queue
 
 from PyQt5.QtCore import QThread, pyqtSignal, QByteArray, QBuffer
 from PyQt5.QtGui import QImage, QPixmap
+
+
+# ============================================================
+# VLC 依赖检测 —— 优先使用项目内嵌的 vlc/ 目录
+# ============================================================
+# 优先级：1. 项目根目录 vlc/  2. PotPlayer  3. 系统 VLC  4. PATH
+_VLC_CANDIDATES = [
+    # 1. 项目内嵌（用户自行复制 VLC 便携版到这里）
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'vlc'),
+]
+# 2. 系统 VLC
+for _p in [
+    r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
+    r"C:\Program Files\PotPlayer\PotPlayerMini64.exe",
+    r"C:\Program Files (x86)\DAUM\PotPlayer\PotPlayerMini.exe",
+    r"C:\Program Files (x86)\PotPlayer\PotPlayerMini.exe",
+    r"C:\Program Files\VideoLAN\VLC",
+    r"C:\Program Files (x86)\VideoLAN\VLC",
+    r"C:\Application\VLC",
+    r"D:\VLC",
+]:
+    _VLC_CANDIDATES.append(os.path.dirname(_p))
+# 3. PATH 环境变量
+for _p in os.environ.get("PATH", "").split(os.pathsep):
+    if _p not in _VLC_CANDIDATES:
+        _VLC_CANDIDATES.append(_p)
+
+_VLC_DIR = None
+for _p in _VLC_CANDIDATES:
+    if os.path.isfile(os.path.join(_p, "libvlc.dll")):
+        _VLC_DIR = _p
+        break
+
+# Python 3.8+：ctypes.LoadLibrary 依赖 add_dll_directory 才能找到 DLL
+if _VLC_DIR and hasattr(os, "add_dll_directory"):
+    try:
+        os.add_dll_directory(_VLC_DIR)
+    except Exception:
+        pass
+if _VLC_DIR:
+    os.environ["PATH"] = _VLC_DIR + os.pathsep + os.environ.get("PATH", "")
+
+# 设置 VLC_PLUGIN_PATH（VLC 运行时要靠它找到解码器插件）
+if _VLC_DIR:
+    _plugin_dir = os.path.join(_VLC_DIR, "plugins")
+    if os.path.isdir(_plugin_dir):
+        os.environ["VLC_PLUGIN_PATH"] = _plugin_dir
+        print(f"[VLC] bundled dir={_VLC_DIR}, plugins={_plugin_dir}")
+    else:
+        for _name in os.listdir(_VLC_DIR) if os.path.isdir(_VLC_DIR) else []:
+            if _name.lower().startswith("plugin"):
+                os.environ["VLC_PLUGIN_PATH"] = os.path.join(_VLC_DIR, _name)
+                print(f"[VLC] bundled dir={_VLC_DIR}, plugins={os.path.join(_VLC_DIR, _name)}")
+                break
+
+# 尝试 import python-vlc
+try:
+    import vlc as _vlc_module
+    _test_inst = _vlc_module.Instance("--no-xlib --quiet --no-video-title-show --no-osd")
+    if _test_inst is not None:
+        _test_player = _test_inst.media_player_new()
+        if _test_player is not None:
+            _vlc_module_found = True
+            print(f"[VLC] python-vlc 已就绪（libvlc.dll 来自：{_VLC_DIR or '系统 PATH'}）")
+        else:
+            _vlc_module_found = False
+            print("[VLC] VLC player 创建失败（位数不匹配？）")
+    else:
+        _vlc_module_found = False
+        print("[VLC] VLC Instance 创建失败")
+except Exception as _e:
+    _vlc_module_found = False
+    _vlc_module = None
+    print(f"[VLC] python-vlc 不可用：{_e}")
+
+
+def get_vlc_module():
+    return _vlc_module if _vlc_module_found else None
+
+
+def get_vlc_instance():
+    """复用 utils 模块导入时已创建并验证过的 VLC Instance，避免重复创建导致 NoneType 错误"""
+    return _test_inst if _vlc_module_found else None
+
+
+def has_vlc():
+    return _vlc_module_found
+
+
+def get_vlc_dir():
+    return _VLC_DIR
 
 
 # ============================================================
