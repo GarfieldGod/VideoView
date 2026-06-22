@@ -1,0 +1,220 @@
+name: Release Build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Windows 构建 (videoview)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装 VLC 便携版（供打包用）
+        shell: pwsh
+        run: |
+          # 从 VideoLAN 官网下载最新 VLC 64-bit 便携版
+          $VLC_VERSION = "3.0.21"
+          $url = "https://download.videolan.org/videolan/vlc/${VLC_VERSION}/win64/vlc-${VLC_VERSION}-win64.zip"
+          $zip = "$env:TEMP\vlc.zip"
+          Write-Host "Downloading VLC ${VLC_VERSION} ..."
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          Write-Host "Extracting VLC ..."
+          Expand-Archive -Path $zip -DestinationPath "$env:TEMP\vlc-temp" -Force
+          # 顶层目录一般是 "vlc-${VLC_VERSION}"
+          $inner = Get-ChildItem "$env:TEMP\vlc-temp" -Directory | Select-Object -First 1
+          if ($inner) {
+              Move-Item "$($inner.FullName)" "$env:GITHUB_WORKSPACE\vlc" -Force
+              Write-Host "VLC installed at $env:GITHUB_WORKSPACE\vlc"
+          } else {
+              # 某些包可能没有内部目录
+              Move-Item "$env:TEMP\vlc-temp" "$env:GITHUB_WORKSPACE\vlc" -Force
+              Write-Host "VLC installed at $env:GITHUB_WORKSPACE\vlc (flat)"
+          }
+          # 验证核心文件存在
+          if (-not (Test-Path "$env:GITHUB_WORKSPACE\vlc\libvlc.dll")) {
+              Write-Error "libvlc.dll not found in vlc/ directory"
+              exit 1
+          }
+          Write-Host "VLC directory structure OK."
+          Get-ChildItem "$env:GITHUB_WORKSPACE\vlc" -Directory | Select-Object Name
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装 Python 依赖
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: PyInstaller 打包
+        shell: pwsh
+        run: |
+          python -m PyInstaller videoview.spec --clean --noconfirm
+
+      - name: 校验产物
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\videoview\videoview.exe")) {
+              Write-Error "videoview.exe 未生成！"
+              exit 1
+          }
+          Write-Host "videoview.exe 存在"
+          Get-ChildItem "dist\videoview" | Select-Object Name, Length | Select-Object -First 30
+
+      - name: 生成 zip 压缩包
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.release.tag_name }}"
+          if ([string]::IsNullOrEmpty($version)) { $version = "snapshot" }
+          $zipName = "videoview-windows-${version}.zip"
+          Compress-Archive -Path "dist\videoview\*" -DestinationPath $zipName -Force
+          Write-Host "打包完成：${zipName}"
+          (Get-Item $zipName).Length
+
+      - name: 上传 Release Asset
+        if: github.event_name == 'release'
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.release.tag_name }}"
+          $zipName = "videoview-windows-${version}.zip"
+          if (-not (Test-Path $zipName)) { $zipName = (Get-ChildItem videoview-windows-*.zip | Select-Object -First 1).Name }
+          Write-Host "上传 Release Asset: ${zipName}"
+          curl.exe -L `
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" `
+            -H "Content-Type: application/zip" `
+            --data-binary "@${zipName}" `
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ github.event.release.id }}/assets?name=${zipName}"
+
+      - name: 上传 Artifact（用于非 release 触发时调试）
+        uses: actions/upload-artifact@v4
+        with:
+          name: videoview-windows
+          path: dist/videoview/
+
+  build-linux:
+    name: Linux 构建 (videoview)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装系统依赖（VLC + Qt 运行库）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              libvlc-dev libvlccore-dev vlc-bin vlc-data \
+              libxcb-xinerama0 libxkbcommon0 libgl1 libegl1 \
+              libopengl0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+              libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+              libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1 \
+              libxkbcommon-x11-0 libdbus-1-3 libfontconfig1 libfreetype6 \
+              libglx0 libglvnd0 libx11-xcb1 libxcb-glx0 libxcb-dri2-0 \
+              libxcb-dri3-0 libxcb-present0 libxcb-shm0 \
+              libegl-mesa0 libglx-mesa0 mesa-utils \
+              xvfb xauth upx-ucl
+          echo "系统依赖已安装"
+          which vlc
+          vlc --version | head -n 3
+          ldconfig -p | grep libvlc | head -n 5
+
+      - name: 把系统 VLC 提取到项目 vlc/ 目录（保证跨机器可运行）
+        run: |
+          # 1. 查找 VLC 的 so 文件与插件目录
+          VLC_LIB_DIR=$(dirname $(ldconfig -p | grep "libvlc\.so\." | head -n 1 | awk '{print $NF}'))
+          echo "VLC lib dir: ${VLC_LIB_DIR}"
+          if [ -z "$VLC_LIB_DIR" ] || [ ! -d "$VLC_LIB_DIR" ]; then
+              # Ubuntu 22.04+ 可能在 /usr/lib/x86_64-linux-gnu
+              VLC_LIB_DIR="/usr/lib/x86_64-linux-gnu"
+          fi
+          PLUGIN_DIR=$(find /usr -type d -name "plugins" -path "*vlc*" 2>/dev/null | head -n 1)
+          echo "VLC plugin dir: ${PLUGIN_DIR}"
+
+          mkdir -p "$GITHUB_WORKSPACE/vlc/lib"
+          mkdir -p "$GITHUB_WORKSPACE/vlc/plugins"
+
+          # 2. 复制主要 .so 库到 vlc/lib/
+          for lib in libvlc.so libvlccore.so libvlc.so.* libvlccore.so.*; do
+              find "$VLC_LIB_DIR" -maxdepth 2 -name "$lib" -exec cp -f {} "$GITHUB_WORKSPACE/vlc/lib/" \; 2>/dev/null || true
+          done
+          # 3. 复制 VLC 插件到 vlc/plugins/（保留子目录结构）
+          if [ -n "$PLUGIN_DIR" ] && [ -d "$PLUGIN_DIR" ]; then
+              cp -r "$PLUGIN_DIR"/* "$GITHUB_WORKSPACE/vlc/plugins/" 2>/dev/null || true
+          fi
+          # 4. 同时复制 VLC 可能依赖的音频/视频解码器 .so（兜底）
+          for dep in libvlc libvlccore libavcodec libavformat libavutil libswscale \
+                     libasound libpulse libsamplerate libsndfile libfreetype \
+                     libfontconfig libharfbuzz libegl libGL libGLX libxcb \
+                     libxkbcommon libdbus-1 libcap librt libnsl libtirpc; do
+              find "$VLC_LIB_DIR" -maxdepth 2 -name "${dep}.so*" -exec cp -f {} "$GITHUB_WORKSPACE/vlc/lib/" \; 2>/dev/null || true
+          done
+          # 5. 复制 plugins.dat（如果存在）
+          if [ -f "$PLUGIN_DIR/../plugins.dat" ]; then
+              cp "$PLUGIN_DIR/../plugins.dat" "$GITHUB_WORKSPACE/vlc/lib/" 2>/dev/null || true
+          fi
+          ls -la "$GITHUB_WORKSPACE/vlc/lib/" | head -n 20
+          echo "---"
+          ls -la "$GITHUB_WORKSPACE/vlc/plugins/" | head -n 20
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装 Python 依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: PyInstaller 打包
+        run: |
+          # 为 Linux 生成 Xvfb 以便 headless 运行（打包后运行时用户需要 x 环境）
+          python -m PyInstaller videoview.spec --clean --noconfirm
+
+      - name: 校验产物
+        run: |
+          if [ ! -f "dist/videoview/videoview" ]; then
+              echo "ERROR: videoview 可执行文件未生成"
+              ls -la dist/
+              exit 1
+          fi
+          chmod +x dist/videoview/videoview
+          ls -la dist/videoview/ | head -n 30
+
+      - name: 生成 tar.gz 压缩包
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          if [ -z "$VERSION" ]; then VERSION="snapshot"; fi
+          TAR_NAME="videoview-linux-${VERSION}.tar.gz"
+          tar -czf "$TAR_NAME" -C dist/videoview .
+          echo "打包完成：${TAR_NAME}"
+          ls -lh "$TAR_NAME"
+
+      - name: 上传 Release Asset
+        if: github.event_name == 'release'
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          TAR_NAME="videoview-linux-${VERSION}.tar.gz"
+          if [ ! -f "$TAR_NAME" ]; then
+              TAR_NAME=$(ls videoview-linux-*.tar.gz | head -n 1)
+          fi
+          echo "上传 Release Asset: ${TAR_NAME}"
+          curl -L \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/gzip" \
+            --data-binary "@${TAR_NAME}" \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/${{ github.event.release.id }}/assets?name=${TAR_NAME}"
+
+      - name: 上传 Artifact（用于非 release 触发时调试）
+        uses: actions/upload-artifact@v4
+        with:
+          name: videoview-linux
+          path: dist/videoview/
